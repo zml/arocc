@@ -10,17 +10,21 @@ pub fn main() !void {
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
 
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     const args = try std.process.argsAlloc(arena);
     if (args.len != 3) {
-        const stderr, _ = std.debug.lockStderrWriter(&.{});
-        stderr.print("Usage: {s} <input-file> <output-path>", .{args[0]}) catch {};
+        const stderr = try std.Io.lockStderr(io, &.{}, null);
+        stderr.file_writer.interface.print("Usage: {s} <input-file> <output-path>", .{args[0]}) catch {};
         std.process.exit(1);
     }
 
     const input_path = args[1];
     const output_path = args[2];
 
-    const input = try std.fs.cwd().readFileAlloc(input_path, gpa, .unlimited);
+    const input = try std.Io.Dir.cwd().readFileAlloc(io, input_path, gpa, .unlimited);
     defer gpa.free(input);
 
     var values: std.StringArrayHashMapUnmanaged([]const []const u8) = .empty;
@@ -92,11 +96,11 @@ pub fn main() !void {
         }
     }
 
-    const output_file = try std.fs.cwd().createFile(output_path, .{});
-    defer output_file.close();
+    const output_file = try std.Io.Dir.cwd().createFile(io, output_path, .{});
+    defer output_file.close(io);
 
     var output_buf: [4196]u8 = undefined;
-    var output_writer = output_file.writer(&output_buf);
+    var output_writer = output_file.writer(io, &output_buf);
     const writer = &output_writer.interface;
 
     try writer.print(
