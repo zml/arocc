@@ -583,6 +583,7 @@ fn scanLibDirForGCCTriple(
     gcc_dir_exists: bool,
     gcc_cross_dir_exists: bool,
 ) !void {
+    const io = tc.driver.comp.io;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var fib = std.heap.FixedBufferAllocator.init(&path_buf);
     const comp = tc.driver.comp;
@@ -598,11 +599,11 @@ fn scanLibDirForGCCTriple(
         const lib_suffix = std.fs.path.join(suffix_buf_fib.allocator(), &.{ base, candidate_triple }) catch continue;
 
         const dir_name = std.fs.path.join(fib.allocator(), &.{ lib_dir, lib_suffix }) catch continue;
-        var parent_dir = comp.cwd.openDir(dir_name, .{ .access_sub_paths = false, .iterate = true }) catch continue;
-        defer parent_dir.close();
+        var parent_dir = comp.cwd.openDir(io, dir_name, .{ .access_sub_paths = false, .iterate = true }) catch continue;
+        defer parent_dir.close(io);
 
         var it = parent_dir.iterate();
-        while (it.next() catch continue) |entry| {
+        while (it.next(io) catch continue) |entry| {
             if (entry.kind != .directory) continue;
 
             const version_text = entry.name;

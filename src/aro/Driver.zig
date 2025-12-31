@@ -1327,6 +1327,7 @@ fn processSource(
     asm_gen_fn: ?AsmCodeGenFn,
 ) !void {
     const gpa = d.comp.gpa;
+    const io = d.comp.io;
     d.comp.generated_buf.items.len = 0;
     const prev_total = d.diagnostics.errors;
 
