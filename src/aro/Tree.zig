@@ -26,6 +26,7 @@ pub const TokenWithExpansionLocs = struct {
     flags: packed struct {
         expansion_disabled: bool = false,
         is_macro_arg: bool = false,
+        pragma_directive: bool = false,
     } = .{},
     /// This location contains the actual token slice which might be generated.
     /// If it is generated then there is guaranteed to be at least one
@@ -3039,7 +3040,7 @@ pub fn dump(tree: *const Tree, term: std.Io.Terminal) std.Io.Terminal.SetColorEr
 fn dumpFieldAttributes(tree: *const Tree, attributes: []const Attribute, level: u32, w: *std.Io.Writer) !void {
     for (attributes) |attr| {
         try w.splatByteAll(' ', level);
-        try w.print("field attr: {s}", .{@tagName(attr.tag)});
+        try w.print("field attr: {t}", .{attr.tag});
         try tree.dumpAttribute(attr, w);
     }
 }
@@ -3101,14 +3102,14 @@ fn dumpNode(
     } else {
         try term.setColor(if (node.isImplicit()) IMPLICIT else TAG);
     }
-    try w.print("{s}", .{@tagName(node)});
+    try w.print("{t}", .{node});
 
     if (node_index.qtOrNull(tree)) |qt| {
         try w.writeAll(": ");
         switch (node) {
             .cast => |cast| {
                 try term.setColor(.white);
-                try w.print("({s}) ", .{@tagName(cast.kind)});
+                try w.print("({t}) ", .{cast.kind});
             },
             else => {},
         }
@@ -3169,7 +3170,7 @@ fn dumpNode(
         while (it.next()) |item| {
             const attr, _ = item;
             try w.splatByteAll(' ', level + half);
-            try w.print("attr: {s}", .{@tagName(attr.tag)});
+            try w.print("attr: {t}", .{attr.tag});
             try tree.dumpAttribute(attr, w);
         }
         try term.setColor(.reset);
