@@ -1607,9 +1607,13 @@ pub const deprecated_declarations: Diagnostic = .{
     .kind = .warning,
 };
 
+pub const deprecated_alternative: Diagnostic = .{
+    .fmt = "use '{s}' instead",
+    .kind = .note,
+};
+
 pub const deprecated_note: Diagnostic = .{
     .fmt = "'{s}' has been explicitly marked deprecated here",
-    .opt = .@"deprecated-declarations",
     .kind = .note,
 };
 
@@ -1961,6 +1965,11 @@ pub const bit_int_vec_not_pow2: Diagnostic = .{
 
 pub const vec_size_not_multiple: Diagnostic = .{
     .fmt = "vector size not an integral multiple of component size",
+    .kind = .@"error",
+};
+
+pub const invalid_neon_vec_size: Diagnostic = .{
+    .fmt = "Neon vector size must be 64 or 128 bits",
     .kind = .@"error",
 };
 
@@ -2573,4 +2582,12 @@ pub const blocks_are_clang_extension: Diagnostic = .{
 pub const block_to_non_function: Diagnostic = .{
     .fmt = "block pointer to non-function type is invalid",
     .kind = .@"error",
+};
+
+pub const c23_attribute: Diagnostic = .{
+    .fmt = "[[]] attributes are a C23 extension",
+    .opt = .@"c23-extensions",
+    .kind = .off,
+    .suppress_version = .c23,
+    .extension = true,
 };

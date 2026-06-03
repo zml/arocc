@@ -755,16 +755,15 @@ pub fn put(i: *Interner, gpa: Allocator, key: Key) !Ref {
 }
 
 fn addExtra(i: *Interner, gpa: Allocator, extra: anytype) Allocator.Error!u32 {
-    const field_names = @typeInfo(@TypeOf(extra)).@"struct".field_names;
-    try i.extra.ensureUnusedCapacity(gpa, field_names.len);
+    const field_count = @typeInfo(@TypeOf(extra)).@"struct".field_names.len;
+    try i.extra.ensureUnusedCapacity(gpa, field_count);
     return i.addExtraAssumeCapacity(extra);
 }
 
 fn addExtraAssumeCapacity(i: *Interner, extra: anytype) u32 {
     const result = @as(u32, @intCast(i.extra.items.len));
-    const field_names = @typeInfo(@TypeOf(extra)).@"struct".field_names;
-    const field_types = @typeInfo(@TypeOf(extra)).@"struct".field_types;
-    inline for (field_names, field_types) |field_name, field_type| {
+    const info = @typeInfo(@TypeOf(extra)).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
         i.extra.appendAssumeCapacity(switch (field_type) {
             Ref => @intFromEnum(@field(extra, field_name)),
             u32 => @field(extra, field_name),
@@ -893,9 +892,8 @@ fn extraData(i: *const Interner, comptime T: type, index: usize) T {
 
 fn extraDataTrail(i: *const Interner, comptime T: type, index: usize) struct { data: T, end: u32 } {
     var result: T = undefined;
-    const field_names = @typeInfo(T).@"struct".field_names;
-    const field_types = @typeInfo(T).@"struct".field_types;
-    inline for (field_names, field_types, 0..) |field_name, field_type, field_i| {
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types, 0..) |field_name, field_type, field_i| {
         const int32 = i.extra.items[field_i + index];
         @field(result, field_name) = switch (field_type) {
             Ref => @enumFromInt(int32),
@@ -905,6 +903,6 @@ fn extraDataTrail(i: *const Interner, comptime T: type, index: usize) struct { d
     }
     return .{
         .data = result,
-        .end = @intCast(index + field_names.len),
+        .end = @intCast(index + info.field_names.len),
     };
 }

@@ -5,6 +5,7 @@ const Interner = @import("backend").Interner;
 const Attribute = @import("Attribute.zig");
 const CodeGen = @import("CodeGen.zig");
 const Compilation = @import("Compilation.zig");
+const Diagnostics = @import("Diagnostics.zig");
 const number_affixes = @import("Tree/number_affixes.zig");
 const Source = @import("Source.zig");
 const Tokenizer = @import("Tokenizer.zig");
@@ -22,6 +23,8 @@ pub const Token = struct {
 };
 
 pub const TokenWithExpansionLocs = struct {
+    const max_expansion_locs = 64;
+
     id: Token.Id,
     flags: packed struct {
         expansion_disabled: bool = false,
@@ -51,8 +54,10 @@ pub const TokenWithExpansionLocs = struct {
             // what we ask for.
             if (list.capacity > 0) {
                 list.items.ptr[list.capacity - 1].byte_offset = 1;
+                tok.expansion_locs = list.items.ptr;
+            } else {
+                tok.expansion_locs = null;
             }
-            tok.expansion_locs = list.items.ptr;
         }
 
         if (tok.expansion_locs) |locs| {
@@ -63,13 +68,22 @@ pub const TokenWithExpansionLocs = struct {
             list.capacity = i + 1;
         }
 
-        const min_len = @max(list.items.len + new.len + 1, 4);
+        if (list.items.len >= max_expansion_locs) return;
+        var new_len: usize = 0;
+        for (new) |new_loc| {
+            if (new_loc.id.index != .generated) new_len += 1;
+        }
+        new_len = @min(new_len, max_expansion_locs - list.items.len);
+        if (new_len == 0) return;
+
+        const min_len = @max(list.items.len + new_len + 1, 4);
         const wanted_len = std.math.ceilPowerOfTwo(usize, min_len) catch
             return error.OutOfMemory;
         try list.ensureTotalCapacity(gpa, wanted_len);
 
         for (new) |new_loc| {
             if (new_loc.id.index == .generated) continue;
+            if (list.items.len >= max_expansion_locs) break;
             list.appendAssumeCapacity(new_loc);
         }
     }
@@ -283,6 +297,8 @@ pub const Node = union(enum) {
     array_filler_expr: ArrayFiller,
     /// Inserted in record and scalar initializers for unspecified elements.
     default_init_expr: DefaultInit,
+
+    codegen_diagnostic: CodegenDiagnostic,
 
     pub const EmptyDecl = struct {
         semicolon: TokenIndex,
@@ -727,6 +743,13 @@ pub const Node = union(enum) {
     pub const DefaultInit = struct {
         last_tok: TokenIndex,
         qt: QualType,
+    };
+
+    pub const CodegenDiagnostic = struct {
+        tok: TokenIndex,
+        kind: Diagnostics.Message.Kind,
+        opt: ?Diagnostics.Option,
+        text: []const u32,
     };
 
     pub const Index = enum(u32) {
@@ -1772,6 +1795,23 @@ pub const Node = union(enum) {
                         },
                     };
                 },
+                .codegen_diagnostic => {
+                    const attr: Node.Repr.DiagnosticPack = @bitCast(node_data[0]);
+                    return .{
+                        .codegen_diagnostic = .{
+                            .tok = node_tok,
+                            .kind = switch (attr.kind) {
+                                .@"error" => .@"error",
+                                .warning => .warning,
+                            },
+                            .opt = switch (attr.opt) {
+                                .none => null,
+                                .@"attribute-warning" => .@"attribute-warning",
+                            },
+                            .text = @ptrCast(tree.extra.items[node_data[1]..][0..node_data[2]]),
+                        },
+                    };
+                },
             };
         }
 
@@ -1857,6 +1897,18 @@ pub const Node = union(enum) {
             implicit: bool = false,
             register: bool = false,
             _: u26 = 0,
+        };
+
+        const DiagnosticPack = packed struct(u32) {
+            kind: enum(u1) {
+                @"error",
+                warning,
+            },
+            opt: enum(u1) {
+                none,
+                @"attribute-warning",
+            },
+            _: u30 = 0,
         };
 
         pub const Tag = enum(u8) {
@@ -1992,6 +2044,7 @@ pub const Node = union(enum) {
             array_filler_expr,
             default_init_expr,
             compound_literal_expr,
+            codegen_diagnostic,
         };
     };
 
@@ -2871,6 +2924,22 @@ pub fn setNode(tree: *Tree, node: Node, index: usize) !void {
             repr.data[2] = @intFromEnum(literal.initializer);
             repr.tok = literal.l_paren_tok;
         },
+        .codegen_diagnostic => |diagnostic| {
+            repr.tag = .codegen_diagnostic;
+            repr.data[0] = @bitCast(Node.Repr.DiagnosticPack{
+                .kind = switch (diagnostic.kind) {
+                    .@"error" => .@"error",
+                    .warning => .warning,
+                    else => unreachable,
+                },
+                .opt = if (diagnostic.opt) |opt| switch (opt) {
+                    .@"attribute-warning" => .@"attribute-warning",
+                    else => unreachable,
+                } else .none,
+            });
+            repr.data[1], repr.data[2] = try tree.addExtra(@ptrCast(diagnostic.text));
+            repr.tok = diagnostic.tok;
+        },
     }
     tree.nodes.set(index, repr);
 }
@@ -3049,25 +3118,25 @@ fn dumpAttribute(tree: *const Tree, attr: Attribute, w: *std.Io.Writer) !void {
     switch (attr.tag) {
         inline else => |tag| {
             const args = @field(attr.args, @tagName(tag));
-            const fields = @typeInfo(@TypeOf(args)).@"struct".fields;
-            if (fields.len == 0) {
+            const info = @typeInfo(@TypeOf(args)).@"struct";
+            if (info.field_names.len == 0) {
                 try w.writeByte('\n');
                 return;
             }
             try w.writeByte(' ');
-            inline for (fields, 0..) |f, i| {
-                if (comptime std.mem.eql(u8, f.name, "__name_tok")) continue;
+            inline for (info.field_names, info.field_types, 0..) |f_name, f_type, i| {
+                if (comptime std.mem.eql(u8, f_name, "__name_tok")) continue;
                 if (i != 0) {
                     try w.writeAll(", ");
                 }
-                try w.writeAll(f.name);
+                try w.writeAll(f_name);
                 try w.writeAll(": ");
-                switch (f.type) {
-                    Interner.Ref => try w.print("\"{s}\"", .{tree.interner.get(@field(args, f.name)).bytes}),
-                    ?Interner.Ref => try w.print("\"{?s}\"", .{if (@field(args, f.name)) |str| tree.interner.get(str).bytes else null}),
-                    else => switch (@typeInfo(f.type)) {
-                        .@"enum" => try w.writeAll(@tagName(@field(args, f.name))),
-                        else => try w.print("{any}", .{@field(args, f.name)}),
+                switch (f_type) {
+                    Interner.Ref => try w.print("\"{s}\"", .{tree.interner.get(@field(args, f_name)).bytes}),
+                    ?Interner.Ref => try w.print("\"{?s}\"", .{if (@field(args, f_name)) |str| tree.interner.get(str).bytes else null}),
+                    else => switch (@typeInfo(f_type)) {
+                        .@"enum" => try w.writeAll(@tagName(@field(args, f_name))),
+                        else => try w.print("{any}", .{@field(args, f_name)}),
                     },
                 }
             }
@@ -3808,5 +3877,12 @@ fn dumpNode(
         .cond_dummy_expr,
         .compound_assign_dummy_expr,
         => {},
+        .codegen_diagnostic => |diagnostic| {
+            try w.splatByteAll(' ', level + 1);
+            try w.print("{t}: {s}", .{ diagnostic.kind, @as([]const u8, @ptrCast(diagnostic.text)) });
+            if (diagnostic.opt) |opt| {
+                try w.print(" [-W{t}]", .{opt});
+            }
+        },
     }
 }

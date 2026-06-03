@@ -336,7 +336,7 @@ pub fn deinit(d: *Diagnostics) void {
 /// Used by the __has_warning builtin macro.
 pub fn warningExists(name: []const u8) bool {
     if (std.mem.eql(u8, name, "pedantic")) return true;
-    inline for (comptime std.meta.declarations(Option)) |group_name| {
+    inline for (@typeInfo(Option).@"enum".decl_names) |group_name| {
         if (std.mem.eql(u8, name, group_name)) return true;
     }
     return std.meta.stringToEnum(Option, name) != null;
@@ -352,7 +352,7 @@ pub fn set(d: *Diagnostics, name: []const u8, to: Message.Kind) Compilation.Erro
         return;
     }
 
-    inline for (comptime std.meta.declarations(Option)) |group_name| {
+    inline for (@typeInfo(Option).@"enum".decl_names) |group_name| {
         if (std.mem.eql(u8, name, group_name)) {
             for (@field(Option, group_name)) |option| {
                 d.state.options.put(option, to);
@@ -497,8 +497,8 @@ pub fn addWithLocation(
 
 pub fn formatArgs(w: *std.Io.Writer, fmt: []const u8, args: anytype) std.Io.Writer.Error!void {
     var i: usize = 0;
-    inline for (comptime std.meta.fieldNames(@TypeOf(args))) |field_name| {
-        const arg = @field(args, field_name);
+    inline for (comptime std.meta.fieldNames(@TypeOf(args))) |arg_name| {
+        const arg = @field(args, arg_name);
         i += switch (@TypeOf(arg)) {
             []const u8 => try formatString(w, fmt[i..], arg),
             else => switch (@typeInfo(@TypeOf(arg))) {

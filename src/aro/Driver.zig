@@ -509,12 +509,16 @@ pub fn parseArgs(
                 pic_arg = arg;
             } else if (mem.eql(u8, arg, "-fropi")) {
                 d.ropi = true;
+                d.comp.code_gen_options.is_ropi = true;
             } else if (mem.eql(u8, arg, "-fno-ropi")) {
                 d.ropi = false;
+                d.comp.code_gen_options.is_ropi = false;
             } else if (mem.eql(u8, arg, "-frwpi")) {
                 d.rwpi = true;
+                d.comp.code_gen_options.is_rwpi = true;
             } else if (mem.eql(u8, arg, "-fno-rwpi")) {
                 d.rwpi = false;
+                d.comp.code_gen_options.is_rwpi = false;
             } else if (mem.eql(u8, arg, "-fshort-enums")) {
                 d.comp.langopts.short_enums = true;
             } else if (mem.eql(u8, arg, "-fno-short-enums")) {
@@ -1054,10 +1058,8 @@ fn parseTarget(d: *Driver, arch_os_abi: []const u8, opt_cpu_features: ?[]const u
         } else if (mem.eql(u8, cpu_name, "baseline")) {
             query.cpu_model = .baseline;
         } else {
-            query.cpu_model = .{
-                .explicit = arch.parseCpuModel(cpu_name) orelse
-                    return d.fatal("unknown CPU model: '{s}'", .{cpu_name}),
-            };
+            query.cpu_model = .{ .explicit = arch.parseCpuModel(cpu_name) orelse
+                return d.fatal("unknown CPU model: '{s}'", .{cpu_name}) };
         }
 
         if (opt_sub_arch) |sub_arch| {
@@ -1094,6 +1096,7 @@ fn parseTarget(d: *Driver, arch_os_abi: []const u8, opt_cpu_features: ?[]const u
         }
     } else if (opt_sub_arch) |sub_arch| {
         if (sub_arch.toFeature(arch)) |feature| {
+            query.cpu_model = .{ .explicit = &.{ .name = "empty", .llvm_name = null, .features = .empty } };
             query.cpu_features_add.addFeature(feature);
         }
     }
@@ -1517,7 +1520,7 @@ fn processSource(
             return;
         }
     } else {
-        var ir = try tree.genIr();
+        var ir = try tree.genIr(&pp);
         defer ir.deinit(gpa);
 
         if (d.verbose_ir) {

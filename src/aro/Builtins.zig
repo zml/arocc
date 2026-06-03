@@ -33,6 +33,7 @@ const common = @import("Builtins/common.def").with(BuiltinBase);
 const hexagon = @import("Builtins/hexagon.def").with(BuiltinTarget);
 const loongarch = @import("Builtins/loongarch.def").with(BuiltinTarget);
 const mips = @import("Builtins/mips.def").with(BuiltinBase);
+const neon = @import("Builtins/neon.def").with(BuiltinTarget);
 const nvptx = @import("Builtins/nvptx.def").with(BuiltinTarget);
 const powerpc = @import("Builtins/powerpc.def").with(BuiltinTarget);
 const riscv = @import("Builtins/riscv.def").with(BuiltinTarget);
@@ -52,6 +53,7 @@ pub const Tag = union(enum) {
     hexagon: hexagon.Tag,
     loongarch: loongarch.Tag,
     mips: mips.Tag,
+    neon: neon.Tag,
     nvptx: nvptx.Tag,
     powerpc: powerpc.Tag,
     riscv: riscv.Tag,
@@ -107,14 +109,7 @@ fn createType(desc: TypeDescription, it: *TypeDescription.TypeIterator, comp: *C
         switch (prefix) {
             .L => builder.combine(.long, 0) catch unreachable,
             .LL => builder.combine(.long_long, 0) catch unreachable,
-            .LLL => {
-                switch (builder.type) {
-                    .none => builder.type = .int128,
-                    .signed => builder.type = .sint128,
-                    .unsigned => builder.type = .uint128,
-                    else => unreachable,
-                }
-            },
+            .LLL => builder.combine(.int128, 0) catch unreachable,
             .Z => require_native_int32 = true,
             .W => require_native_int64 = true,
             .N => {
@@ -143,9 +138,9 @@ fn createType(desc: TypeDescription, it: *TypeDescription.TypeIterator, comp: *C
         .s => builder.combine(.short, 0) catch unreachable,
         .i => {
             if (require_native_int32) {
-                builder.type = specForSize(comp, 32);
+                builder.combine(specForSize(comp, 32), 0) catch unreachable;
             } else if (require_native_int64) {
-                builder.type = specForSize(comp, 64);
+                builder.combine(specForSize(comp, 64), 0) catch unreachable;
             } else {
                 switch (builder.type) {
                     .int128, .sint128, .uint128 => {},
@@ -156,6 +151,7 @@ fn createType(desc: TypeDescription, it: *TypeDescription.TypeIterator, comp: *C
         .h => builder.combine(.fp16, 0) catch unreachable,
         .x => builder.combine(.float16, 0) catch unreachable,
         .y => builder.combine(.bf16, 0) catch unreachable,
+        .m => builder.combine(.mfp8, 0) catch unreachable,
         .f => builder.combine(.float, 0) catch unreachable,
         .d => {
             if (builder.type == .long_long) {
@@ -199,6 +195,10 @@ fn createType(desc: TypeDescription, it: *TypeDescription.TypeIterator, comp: *C
                 .len = element_count,
             } });
             builder.type = .{ .other = vector_qt };
+        },
+        .q => {
+            // Todo: scalable vector
+            return .invalid;
         },
         .Q => {
             // Todo: target builtin type
@@ -336,9 +336,15 @@ pub const FromName = struct {
 pub fn fromName(comp: *Compilation, name: []const u8) ?FromName {
     if (fromNameExtra(name, .common)) |found| return found;
     switch (comp.target.cpu.arch) {
-        .aarch64, .aarch64_be => if (fromNameExtra(name, .aarch64)) |found| return found,
+        .aarch64, .aarch64_be => {
+            if (fromNameExtra(name, .aarch64)) |found| return found;
+            if (fromNameExtra(name, .neon)) |found| return found;
+        },
         .amdgcn => if (fromNameExtra(name, .amdgcn)) |found| return found,
-        .arm, .armeb, .thumb, .thumbeb => if (fromNameExtra(name, .arm)) |found| return found,
+        .arm, .armeb, .thumb, .thumbeb => {
+            if (fromNameExtra(name, .arm)) |found| return found;
+            if (fromNameExtra(name, .neon)) |found| return found;
+        },
         .bpfeb, .bpfel => if (fromNameExtra(name, .bpf)) |found| return found,
         .hexagon => if (fromNameExtra(name, .hexagon)) |found| return found,
         .loongarch32, .loongarch64 => if (fromNameExtra(name, .loongarch)) |found| return found,
@@ -371,7 +377,7 @@ fn fromNameExtra(name: []const u8, comptime arch: std.meta.Tag(Tag)) ?FromName {
         .header = builtin.header,
         .language = builtin.language,
         .attributes = builtin.attributes,
-        .features = if (@hasField(@TypeOf(builtin), "features")) builtin.features else null,
+        .features = if (@hasField(@TypeOf(builtin), "features")) builtin.features else if (arch == .neon) "neon" else null,
     };
 }
 
@@ -385,7 +391,7 @@ test "all builtins" {
                 while (it.next()) |_| {}
             }
             if (@hasField(@TypeOf(builtin), "features")) {
-                const corrected_name = comptime if (std.mem.eql(u8, list_name, "x86_64")) "x86" else list_name;
+                const corrected_name = comptime if (std.mem.eql(u8, list_name, "x86_64")) "x86" else if (std.mem.eql(u8, list_name, "neon")) "aarch64" else list_name;
                 const features = &@field(std.Target, corrected_name).all_features;
 
                 const feature_string = builtin.features orelse continue;

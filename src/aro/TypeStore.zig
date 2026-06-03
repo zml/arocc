@@ -38,6 +38,8 @@ const Repr = struct {
         array_variable,
         array_unspecified_variable,
         vector,
+        vector_neon,
+        vector_neon_poly,
         @"struct",
         struct_incomplete,
         @"union",
@@ -102,6 +104,7 @@ const Index = enum(u29) {
     float_dfloat64 = std.math.maxInt(u29) - 36,
     float_dfloat128 = std.math.maxInt(u29) - 37,
     float_dfloat64x = std.math.maxInt(u29) - 38,
+    mfp8 = std.math.maxInt(u29) - 39,
     _,
 };
 
@@ -149,6 +152,7 @@ pub const QualType = packed struct(u32) {
     pub const dfloat64: QualType = .{ ._index = .float_dfloat64 };
     pub const dfloat128: QualType = .{ ._index = .float_dfloat128 };
     pub const dfloat64x: QualType = .{ ._index = .float_dfloat64x };
+    pub const mfp8: QualType = .{ ._index = .mfp8 };
     pub const void_pointer: QualType = .{ ._index = .void_pointer };
     pub const char_pointer: QualType = .{ ._index = .char_pointer };
     pub const int_pointer: QualType = .{ ._index = .int_pointer };
@@ -220,6 +224,7 @@ pub const QualType = packed struct(u32) {
             .float_dfloat64 => return .{ .float = .dfloat64 },
             .float_dfloat128 => return .{ .float = .dfloat128 },
             .float_dfloat64x => return .{ .float = .dfloat64x },
+            .mfp8 => return .{ .storage_float = .mfp8 },
             .void_pointer => return .{ .pointer = .{ .child = .void } },
             .char_pointer => return .{ .pointer = .{ .child = .char } },
             .int_pointer => return .{ .pointer = .{ .child = .int } },
@@ -311,6 +316,17 @@ pub const QualType = packed struct(u32) {
             .vector => .{ .vector = .{
                 .elem = @bitCast(repr.data[0]),
                 .len = repr.data[1],
+                .kind = .generic,
+            } },
+            .vector_neon => .{ .vector = .{
+                .elem = @bitCast(repr.data[0]),
+                .len = repr.data[1],
+                .kind = .neon,
+            } },
+            .vector_neon_poly => .{ .vector = .{
+                .elem = @bitCast(repr.data[0]),
+                .len = repr.data[1],
+                .kind = .neon_poly,
             } },
             .@"struct", .@"union" => {
                 const layout_size = 5;
@@ -497,6 +513,7 @@ pub const QualType = packed struct(u32) {
             .bool => 1,
             .func => 1,
             .nullptr_t, .pointer, .block => if (qt.bitSizeofOrNull(comp)) |sz| sz / 8 else null,
+            .storage_float => |storage_float| storage_float.bits() / 8,
             .int => |int_ty| int_ty.bits(comp) / 8,
             .float => |float_ty| float_ty.bits(comp) / 8,
             .complex => |complex| complex.sizeofOrNull(comp),
@@ -570,6 +587,7 @@ pub const QualType = packed struct(u32) {
         return loop: switch (qt.base(comp).type) {
             .bool => if (comp.langopts.emulate == .msvc) 8 else 1,
             .bit_int => |bit_int| bit_int.bits,
+            .storage_float => |storage_float| storage_float.bits(),
             .float => |float_ty| float_ty.bits(comp),
             .int => |int_ty| int_ty.bits(comp),
             .nullptr_t, .pointer, .block => qt.attributedPointerBitSize(comp) orelse comp.target.ptrBitWidth(),
@@ -636,6 +654,7 @@ pub const QualType = packed struct(u32) {
         return loop: switch (qt.base(comp).type) {
             .void => 1,
             .bool => 1,
+            .storage_float => |storage_float| storage_float.alignment(),
             .int => |int_ty| switch (int_ty) {
                 .char,
                 .schar,
@@ -1072,6 +1091,7 @@ pub const QualType = packed struct(u32) {
             .void => return true,
             .bool => return true,
             .nullptr_t => return true,
+            .storage_float => |a_storage_float| return a_storage_float == b_type.storage_float,
             .int => |a_int| return a_int == b_type.int,
             .float => |a_float| return a_float == b_type.float,
             .complex => |a_complex| {
@@ -1156,10 +1176,7 @@ pub const QualType = packed struct(u32) {
             },
             .vector => |a_vector| {
                 const b_vector = b_type.vector;
-                if (a_vector.len != b_vector.len) return false;
-
-                // Vector elemnent qualifiers are checked.
-                return a_vector.elem.eqlQualified(b_vector.elem, comp);
+                return a_vector.eql(b_vector, comp, false);
             },
             .@"struct", .@"union", .@"enum" => return a_type_qt.qt._index == b_type_qt.qt._index,
             .block => |a_block| return a_block.func.eql(b_type.block.func, comp),
@@ -1245,7 +1262,12 @@ pub const QualType = packed struct(u32) {
                 continue :loop func.return_type.type(comp);
             },
             .typeof => return true,
-            .typedef => |typedef| return !typedef.base.is(comp, .nullptr_t),
+            .typedef => |typedef| {
+                if (Builder.fromType(comp, typedef.base).str(comp.langopts)) |some| {
+                    return !std.mem.eql(u8, some, typedef.name.lookup(comp));
+                }
+                return true;
+            },
             else => return false,
         }
     }
@@ -1333,6 +1355,13 @@ pub const QualType = packed struct(u32) {
             .typeof => |typeof| if (desugar) {
                 continue :loop typeof.base.type(comp);
             } else {
+                if (qt.@"const" and !typeof.base.@"const") {
+                    try w.writeAll("const ");
+                }
+                if (qt.@"volatile" and !typeof.base.@"volatile") {
+                    try w.writeAll("volatile ");
+                }
+
                 try w.writeAll("typeof(");
                 try typeof.base.print(comp, w);
                 try w.writeAll(")");
@@ -1341,6 +1370,9 @@ pub const QualType = packed struct(u32) {
             .typedef => |typedef| if (desugar) {
                 continue :loop typedef.base.type(comp);
             } else {
+                if (qt.@"const") try w.writeAll("const ");
+                if (qt.@"volatile") try w.writeAll("volatile ");
+
                 try w.writeAll(typedef.name.lookup(comp));
                 return true;
             },
@@ -1362,6 +1394,7 @@ pub const QualType = packed struct(u32) {
             .void => try w.writeAll("void"),
             .bool => try w.writeAll(if (comp.langopts.standard.atLeast(.c23)) "bool" else "_Bool"),
             .nullptr_t => try w.writeAll("nullptr_t"),
+            .storage_float => |storage_float| try w.writeAll(storage_float.name()),
             .int => |int_ty| switch (int_ty) {
                 .char => try w.writeAll("char"),
                 .schar => try w.writeAll("signed char"),
@@ -1408,9 +1441,15 @@ pub const QualType = packed struct(u32) {
             },
 
             .vector => |vector| {
-                try w.print("__attribute__((__vector_size__({d} * sizeof(", .{vector.len});
-                _ = try vector.elem.printPrologue(comp, desugar, w);
-                try w.writeAll(")))) ");
+                switch (vector.kind) {
+                    .generic => {
+                        try w.print("__attribute__((__vector_size__({d} * sizeof(", .{vector.len});
+                        _ = try vector.elem.printPrologue(comp, desugar, w);
+                        try w.writeAll(")))) ");
+                    },
+                    .neon => try w.print("__attribute__((neon_vector_type({d}))) ", .{vector.len}),
+                    .neon_poly => try w.print("__attribute__((neon_polyvector_type({d}))) ", .{vector.len}),
+                }
                 _ = try vector.elem.printPrologue(comp, desugar, w);
             },
 
@@ -1537,7 +1576,12 @@ pub const QualType = packed struct(u32) {
                 try array.elem.dump(comp, w);
             },
             .vector => |vector| {
-                try w.print("vector({d}, ", .{vector.len});
+                const kind = switch (vector.kind) {
+                    .generic => "vector",
+                    .neon => "neon_vector",
+                    .neon_poly => "neon_polyvector",
+                };
+                try w.print("{s}({d}, ", .{ kind, vector.len });
                 try vector.elem.dump(comp, w);
                 try w.writeAll(")");
             },
@@ -1578,6 +1622,7 @@ pub const Type = union(enum) {
 
     int: Int,
     float: Float,
+    storage_float: StorageFloat,
     complex: QualType,
     bit_int: BitInt,
     atomic: QualType,
@@ -1670,6 +1715,29 @@ pub const Type = union(enum) {
         }
     };
 
+    /// non-arithmetic floats
+    pub const StorageFloat = enum {
+        mfp8,
+
+        pub fn bits(storage_float: StorageFloat) u16 {
+            return switch (storage_float) {
+                .mfp8 => 8,
+            };
+        }
+
+        pub fn alignment(storage_float: StorageFloat) u32 {
+            return switch (storage_float) {
+                .mfp8 => 1,
+            };
+        }
+
+        pub fn name(storage_float: StorageFloat) []const u8 {
+            return switch (storage_float) {
+                .mfp8 => "__mfp8",
+            };
+        }
+    };
+
     pub const BitInt = struct {
         /// Must be >= 1 if unsigned and >= 2 if signed
         bits: u16,
@@ -1738,6 +1806,20 @@ pub const Type = union(enum) {
     pub const Vector = struct {
         elem: QualType,
         len: u32,
+        kind: Kind = .generic,
+
+        pub const Kind = enum {
+            generic,
+            neon,
+            neon_poly,
+        };
+
+        pub fn eql(a: Vector, b: Vector, comp: *const Compilation, check_kind: bool) bool {
+            if (a.len != b.len) return false;
+            if (!a.elem.eqlQualified(b.elem, comp)) return false;
+            if (check_kind and a.kind != b.kind) return false;
+            return true;
+        }
     };
 
     pub const Record = struct {
@@ -1940,6 +2022,9 @@ pub fn putExtra(ts: *TypeStore, gpa: std.mem.Allocator, ty: Type) !Index {
             .dfloat128 => return .float_dfloat128,
             .dfloat64x => return .float_dfloat64x,
         },
+        .storage_float => |storage_float| switch (storage_float) {
+            .mfp8 => return .mfp8,
+        },
         else => {},
     }
     const index = try ts.types.addOne(gpa);
@@ -1955,6 +2040,7 @@ pub fn set(ts: *TypeStore, gpa: std.mem.Allocator, ty: Type, index: usize) !void
         .nullptr_t => unreachable,
         .int => unreachable,
         .float => unreachable,
+        .storage_float => unreachable,
         .complex => |complex| {
             repr.tag = .complex;
             repr.data[0] = @bitCast(complex);
@@ -2048,7 +2134,11 @@ pub fn set(ts: *TypeStore, gpa: std.mem.Allocator, ty: Type, index: usize) !void
             }
         },
         .vector => |vector| {
-            repr.tag = .vector;
+            repr.tag = switch (vector.kind) {
+                .generic => .vector,
+                .neon => .vector_neon,
+                .neon_poly => .vector_neon_poly,
+            };
             repr.data[0] = @bitCast(vector.elem);
             repr.data[1] = vector.len;
         },
@@ -2590,6 +2680,7 @@ pub const Builder = struct {
 
         bf16,
         fp16,
+        mfp8,
         float16,
         float,
         double,
@@ -2688,6 +2779,7 @@ pub const Builder = struct {
 
                 .bf16 => "__bf16",
                 .fp16 => "__fp16",
+                .mfp8 => "__mfp8",
                 .float16 => "_Float16",
                 .float => "float",
                 .double => "double",
@@ -2820,6 +2912,7 @@ pub const Builder = struct {
 
             .bf16 => .bf16,
             .fp16 => .fp16,
+            .mfp8 => .mfp8,
             .float16 => .float16,
             .float => .float,
             .double => .double,
@@ -3234,6 +3327,10 @@ pub const Builder = struct {
                 .none => .fp16,
                 else => return b.cannotCombine(source_tok),
             },
+            .mfp8 => switch (b.type) {
+                .none => .mfp8,
+                else => return b.cannotCombine(source_tok),
+            },
             .float16 => switch (b.type) {
                 .none => .float16,
                 .complex => .complex_float16,
@@ -3431,6 +3528,9 @@ pub const Builder = struct {
                 .dfloat64 => .dfloat64,
                 .dfloat128 => .dfloat128,
                 .dfloat64x => .dfloat64x,
+            },
+            .storage_float => |storage_float| switch (storage_float) {
+                .mfp8 => .mfp8,
             },
             .complex => |complex| switch (complex.base(comp).type) {
                 .int => |int| switch (int) {

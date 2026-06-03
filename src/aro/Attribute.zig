@@ -89,10 +89,9 @@ pub fn requiredArgCount(attr: Tag) u32 {
         inline else => |tag| {
             comptime var needed = 0;
             comptime {
-                const field_names = @typeInfo(@field(attributes, @tagName(tag))).@"struct".field_names;
-                const field_types = @typeInfo(@field(attributes, @tagName(tag))).@"struct".field_types;
-                for (field_names, field_types) |field_name, field_type| {
-                    if (!mem.eql(u8, field_name, "__name_tok") and @typeInfo(field_type) != .optional) needed += 1;
+                const info = @typeInfo(@field(attributes, @tagName(tag))).@"struct";
+                for (info.field_names, info.field_types) |arg_name, arg_type| {
+                    if (!mem.eql(u8, arg_name, "__name_tok") and @typeInfo(arg_type) != .optional) needed += 1;
                 }
             }
             return needed;
@@ -107,8 +106,8 @@ pub fn maxArgCount(attr: Tag) u32 {
             comptime var max = 0;
             comptime {
                 const field_names = @typeInfo(@field(attributes, @tagName(tag))).@"struct".field_names;
-                for (field_names) |field_name| {
-                    if (!mem.eql(u8, field_name, "__name_tok")) max += 1;
+                for (field_names) |arg_field_name| {
+                    if (!mem.eql(u8, arg_field_name, "__name_tok")) max += 1;
                 }
             }
             return max;
@@ -186,13 +185,12 @@ pub fn wantsIdentEnum(attr: Tag) bool {
 pub fn diagnoseIdent(attr: Tag, arguments: *Arguments, ident: TokenIndex, p: *Parser) !bool {
     switch (attr) {
         inline else => |tag| {
-            const field_types = @typeInfo(@field(attributes, @tagName(tag))).@"struct".field_types;
-            const field_names = @typeInfo(@field(attributes, @tagName(tag))).@"struct".field_names;
-            if (field_types.len == 0) unreachable;
-            const Unwrapped = UnwrapOptional(field_types[0]);
+            const info = @typeInfo(@field(attributes, @tagName(tag))).@"struct";
+            if (info.field_names.len == 0) unreachable;
+            const Unwrapped = UnwrapOptional(info.field_types[0]);
             if (@typeInfo(Unwrapped) != .@"enum") unreachable;
             if (std.meta.stringToEnum(Unwrapped, normalize(p.tokSlice(ident)))) |enum_val| {
-                @field(@field(arguments, @tagName(tag)), field_names[0]) = enum_val;
+                @field(@field(arguments, @tagName(tag)), info.field_names[0]) = enum_val;
                 return false;
             }
 
@@ -219,13 +217,12 @@ pub fn wantsAlignment(attr: Tag, idx: usize) bool {
 pub fn diagnoseAlignment(attr: Tag, arguments: *Arguments, arg_idx: u32, res: Parser.Result, arg_start: TokenIndex, p: *Parser) !bool {
     switch (attr) {
         inline else => |tag| {
-            const field_types = @typeInfo(@field(attributes, @tagName(tag))).@"struct".field_types;
-            const field_names = @typeInfo(@field(attributes, @tagName(tag))).@"struct".field_names;
-            if (field_types.len == 0) unreachable;
+            const arg_info = @typeInfo(@field(attributes, @tagName(tag))).@"struct";
+            if (arg_info.field_names.len == 0) unreachable;
 
             switch (arg_idx) {
-                inline 0...field_types.len - 1 => |arg_i| {
-                    if (UnwrapOptional(field_types[arg_i]) != Alignment) unreachable;
+                inline 0...arg_info.field_names.len - 1 => |arg_i| {
+                    if (UnwrapOptional(arg_info.field_types[arg_i]) != Alignment) unreachable;
 
                     if (!res.val.is(.int, p.comp)) {
                         try p.err(arg_start, .alignas_unavailable, .{});
@@ -244,7 +241,7 @@ pub fn diagnoseAlignment(attr: Tag, arguments: *Arguments, arg_idx: u32, res: Pa
                         return true;
                     }
 
-                    @field(@field(arguments, @tagName(tag)), field_names[arg_i]) = .{ .requested = requested };
+                    @field(@field(arguments, @tagName(tag)), arg_info.field_names[arg_i]) = .{ .requested = requested };
                     return false;
                 },
                 else => unreachable,
@@ -254,8 +251,8 @@ pub fn diagnoseAlignment(attr: Tag, arguments: *Arguments, arg_idx: u32, res: Pa
 }
 
 fn diagnoseField(
-    comptime decl_name: []const u8,
-    comptime field_name: []const u8,
+    comptime decl_name: [:0]const u8,
+    comptime field_name: [:0]const u8,
     comptime Wanted: type,
     arguments: *Arguments,
     res: Parser.Result,
@@ -354,11 +351,10 @@ pub fn diagnose(attr: Tag, arguments: *Arguments, arg_idx: u32, res: Parser.Resu
                 return true;
             }
 
-            const field_types = @typeInfo(@field(attributes, decl_name)).@"struct".field_types;
-            const field_names = @typeInfo(@field(attributes, decl_name)).@"struct".field_names;
+            const arg_info = @typeInfo(@field(attributes, decl_name)).@"struct";
             switch (arg_idx) {
-                inline 0...field_types.len - 1 => |arg_i| {
-                    return diagnoseField(decl_name, field_names[arg_i], UnwrapOptional(field_types[arg_i]), arguments, res, arg_start, node, p);
+                inline 0...arg_info.field_names.len - 1 => |arg_i| {
+                    return diagnoseField(decl_name, arg_info.field_names[arg_i], UnwrapOptional(arg_info.field_types[arg_i]), arguments, res, arg_start, node, p);
                 },
                 else => unreachable,
             }
@@ -435,6 +431,7 @@ const attributes = struct {
     };
     pub const deprecated = struct {
         msg: ?Value = null,
+        alternative: ?Value = null, // C23 deprecated attribute only takes 1 argument
         __name_tok: TokenIndex,
     };
     pub const designated_init = struct {};
@@ -745,20 +742,24 @@ const attributes = struct {
     // TODO cannot be combined with weak or selectany
     pub const internal_linkage = struct {};
     pub const availability = struct {};
+    pub const neon_vector_type = struct {
+        len: u32,
+    };
+    pub const neon_polyvector_type = struct {
+        len: u32,
+    };
 };
 
 pub const Tag = std.meta.DeclEnum(attributes);
 
 pub const Arguments = blk: {
     const decl_names = @typeInfo(attributes).@"struct".decl_names;
-    var names: [decl_names.len][]const u8 = undefined;
     var types: [decl_names.len]type = undefined;
-    for (decl_names, &names, &types) |decl_name, *name, *T| {
-        name.* = decl_name;
+    for (decl_names, &types) |decl_name, *T| {
         T.* = @field(attributes, decl_name);
     }
 
-    break :blk @Union(.auto, null, &names, &types, &@splat(.{}));
+    break :blk @Union(.auto, null, decl_names, &types, &@splat(.{}));
 };
 
 pub fn ArgumentsForTag(comptime tag: Tag) type {
@@ -849,6 +850,8 @@ pub fn applyVariableAttributes(p: *Parser, qt: QualType, attr_buf_start: usize, 
             nocommon = true;
         },
         .vector_size => try attr.applyVectorSize(p, tok, &base_qt),
+        .neon_vector_type => try attr.applyNeonVector(p, tok, &base_qt, .neon),
+        .neon_polyvector_type => try attr.applyNeonVector(p, tok, &base_qt, .neon_poly),
         .aligned => try attr.applyAligned(p, base_qt, diagnostic),
         .nonstring => {
             if (base_qt.get(p.comp, .array)) |array_ty| {
@@ -941,6 +944,8 @@ pub fn applyTypeAttributes(p: *Parser, qt: QualType, attr_buf_start: usize, diag
             // zig fmt: on
             .transparent_union => try attr.applyTransparentUnion(p, tok, base_qt),
             .vector_size => try attr.applyVectorSize(p, tok, &base_qt),
+            .neon_vector_type => try attr.applyNeonVector(p, tok, &base_qt, .neon),
+            .neon_polyvector_type => try attr.applyNeonVector(p, tok, &base_qt, .neon_poly),
             .aligned => try attr.applyAligned(p, base_qt, diagnostic),
             .designated_init => if (base_qt.is(p.comp, .@"struct")) {
                 try p.attr_application_buf.append(gpa, attr);
@@ -1241,6 +1246,61 @@ fn applyVectorSize(attr: Attribute, p: *Parser, tok: TokenIndex, qt: *QualType) 
     qt.* = try p.comp.type_store.put(p.comp.gpa, .{ .vector = .{
         .elem = qt.*,
         .len = @intCast(vec_bytes / elem_size),
+    } });
+}
+
+fn applyNeonVector(attr: Attribute, p: *Parser, tok: TokenIndex, qt: *QualType, kind: Type.Vector.Kind) !void {
+    if (qt.isInvalid()) return;
+    const valid_elem_ty = blk: {
+        if (kind == .neon_poly) {
+            const int_ty = qt.get(p.comp, .int) orelse break :blk false;
+            const poly_unsigned = p.comp.target.cpu.arch.isAARCH64();
+            break :blk if (poly_unsigned)
+                switch (int_ty) {
+                    .uchar, .ushort, .ulong, .ulong_long => true,
+                    else => false,
+                }
+            else switch (int_ty) {
+                .schar, .short, .long_long => true,
+                else => false,
+            };
+        }
+
+        const base_ty = qt.base(p.comp).type;
+        break :blk switch (base_ty) {
+            .int => |int| switch (int) {
+                .schar, .uchar, .short, .ushort, .int, .uint, .long, .ulong, .long_long, .ulong_long => true,
+                else => false,
+            },
+            .float => |float| switch (float) {
+                .float, .fp16, .bf16 => true,
+                .double => p.comp.target.cpu.arch.isAARCH64(),
+                else => false,
+            },
+            .storage_float => |storage_float| switch (storage_float) {
+                .mfp8 => true,
+            },
+            else => false,
+        };
+    };
+    if (!valid_elem_ty) {
+        try p.err(tok, .invalid_vec_elem_ty, .{qt.*});
+        return error.ParsingFailed;
+    }
+
+    // Neon vector size must be 64 or 128 bits
+    const elem_size = qt.bitSizeof(p.comp);
+    const vec_len = if (kind == .neon) attr.args.neon_vector_type.len else attr.args.neon_polyvector_type.len;
+    const vec_size = elem_size * vec_len;
+    if (vec_size != 64 and vec_size != 128) {
+        try p.err(tok, .invalid_neon_vec_size, .{});
+        return error.ParsingFailed;
+    }
+
+    qt.* = try p.comp.type_store.put(p.comp.gpa, .{ .vector = .{
+        .elem = qt.*,
+        .len = vec_len,
+        .kind = kind,
     } });
 }
 

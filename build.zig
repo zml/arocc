@@ -194,6 +194,7 @@ pub fn build(b: *Build) !void {
             generateDef(b, "Builtins/hexagon.def"),
             generateDef(b, "Builtins/loongarch.def"),
             generateDef(b, "Builtins/mips.def"),
+            generateDef(b, "Builtins/neon.def"),
             generateDef(b, "Builtins/nvptx.def"),
             generateDef(b, "Builtins/powerpc.def"),
             generateDef(b, "Builtins/riscv.def"),
@@ -248,13 +249,18 @@ pub fn build(b: *Build) !void {
         break :step &run_cmd.step;
     });
 
-    const fmt_dirs = b.pathList(&.{ "build", "build.zig", "src", "test" });
+    const fmt_dirs: [4]std.Build.LazyPath = .{
+        b.path("build"),
+        b.path("build.zig"),
+        b.path("src"),
+        b.path("test"),
+    };
 
     b.step("fmt", "Modify source files in place to have conforming formatting")
-        .dependOn(&b.addFmt(.{ .paths = fmt_dirs }).step);
+        .dependOn(&b.addFmt(.{ .paths = &fmt_dirs }).step);
 
     const test_fmt_step = b.step("test-fmt", "Check source files having conforming formatting");
-    test_fmt_step.dependOn(&b.addFmt(.{ .paths = fmt_dirs, .check = true }).step);
+    test_fmt_step.dependOn(&b.addFmt(.{ .paths = &fmt_dirs, .check = true }).step);
 
     // tracy integration
     if (tracy) |tracy_path| {

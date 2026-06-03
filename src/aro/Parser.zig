@@ -455,8 +455,8 @@ pub fn err(p: *Parser, tok_i: TokenIndex, diagnostic: Diagnostic, args: anytype)
 
 fn formatArgs(p: *Parser, w: *std.Io.Writer, fmt: []const u8, args: anytype) !void {
     var i: usize = 0;
-    inline for (comptime std.meta.fieldNames(@TypeOf(args))) |field_name| {
-        const arg = @field(args, field_name);
+    inline for (comptime std.meta.fieldNames(@TypeOf(args))) |arg_name| {
+        const arg = @field(args, arg_name);
         i += switch (@TypeOf(arg)) {
             []const u8 => try Diagnostics.formatString(w, fmt[i..], arg),
             Tree.Token.Id => try formatTokenId(w, fmt[i..], arg),
@@ -618,11 +618,11 @@ pub fn errValueChanged(p: *Parser, tok_i: TokenIndex, diagnostic: Diagnostic, re
 fn checkDeprecatedUnavailable(p: *Parser, ty: QualType, usage_tok: TokenIndex, decl_tok: TokenIndex) !void {
     if (ty.getAttribute(p.comp, .@"error")) |@"error"| {
         const msg_str = p.comp.interner.get(@"error".msg.ref()).bytes;
-        try p.err(usage_tok, .error_attribute, .{ p.tokSlice(@"error".__name_tok), Escaped.init(msg_str) });
+        try p.codegenDiagnostic(usage_tok, .error_attribute, .{ p.tokSlice(@"error".__name_tok), Escaped.init(msg_str) });
     }
     if (ty.getAttribute(p.comp, .warning)) |warning| {
         const msg_str = p.comp.interner.get(warning.msg.ref()).bytes;
-        try p.err(usage_tok, .warning_attribute, .{ p.tokSlice(warning.__name_tok), Escaped.init(msg_str) });
+        try p.codegenDiagnostic(usage_tok, .warning_attribute, .{ p.tokSlice(warning.__name_tok), Escaped.init(msg_str) });
     }
     if (ty.getAttribute(p.comp, .unavailable)) |unavailable| {
         try p.errDeprecated(usage_tok, .unavailable, unavailable.msg);
@@ -631,8 +631,39 @@ fn checkDeprecatedUnavailable(p: *Parser, ty: QualType, usage_tok: TokenIndex, d
     }
     if (ty.getAttribute(p.comp, .deprecated)) |deprecated| {
         try p.errDeprecated(usage_tok, .deprecated_declarations, deprecated.msg);
+        if (deprecated.alternative) |alternative| {
+            const alt_str = p.comp.interner.get(alternative.ref()).bytes;
+            try p.err(usage_tok, .deprecated_alternative, .{alt_str});
+        }
         try p.err(deprecated.__name_tok, .deprecated_note, .{p.tokSlice(decl_tok)});
     }
+}
+
+fn codegenDiagnostic(p: *Parser, usage_tok: TokenIndex, diagnostic: Diagnostic, args: anytype) !void {
+    assert(!diagnostic.extension);
+    assert(diagnostic.suppress_unless_version == null);
+    assert(diagnostic.suppress_version == null);
+    if (p.diagnostics.effectiveKind(diagnostic) == .off) return;
+
+    var bfa_buf: [1024]u8 align(4) = undefined;
+    var bfa: std.heap.BufferFirstAllocator = .init(&bfa_buf, p.comp.gpa);
+    var allocating: std.Io.Writer.Allocating = .initAligned(bfa.allocator(), .of(u32));
+    defer allocating.deinit();
+
+    p.formatArgs(&allocating.writer, diagnostic.fmt, args) catch return error.OutOfMemory;
+
+    const remainder = 4 - allocating.written().len % 4;
+    allocating.writer.splatByteAll(0, remainder) catch return error.OutOfMemory;
+
+    const node = try p.tree.addNode(.{
+        .codegen_diagnostic = .{
+            .tok = usage_tok,
+            .kind = diagnostic.kind,
+            .opt = diagnostic.opt,
+            .text = @ptrCast(@alignCast(allocating.written())),
+        },
+    });
+    try p.decl_buf.append(p.comp.gpa, node);
 }
 
 fn errDeprecated(p: *Parser, tok_i: TokenIndex, diagnostic: Diagnostic, msg: ?Value) Compilation.Error!void {
@@ -854,6 +885,9 @@ pub fn parse(pp: *Preprocessor) Compilation.Error!Tree {
 
         if (p.comp.float80Type()) |float80_ty| {
             try p.addImplicitTypedef("__float80", float80_ty);
+        }
+        if (p.comp.target.hasAArch64ACLETypes()) {
+            try p.addImplicitTypedef("__mfp8", .mfp8);
         }
 
         // Set here so that the newly generated tokens are included.
@@ -1933,12 +1967,12 @@ fn msvcAttributeList(p: *Parser) Error!void {
 }
 
 fn c23Attribute(p: *Parser) !bool {
-    if (!p.comp.langopts.standard.atLeast(.c23)) return false;
     const bracket1 = p.eatToken(.l_bracket) orelse return false;
     const bracket2 = p.eatToken(.l_bracket) orelse {
         p.tok_i -= 1;
         return false;
     };
+    try p.err(bracket1, .c23_attribute, .{});
 
     try p.c23AttributeList();
 
@@ -2194,6 +2228,25 @@ fn initDeclarator(p: *Parser, decl_spec: *DeclSpec, attr_buf_top: usize, decl_no
     return init_d;
 }
 
+fn exactTypeKeywordToSpecMSVC(id: Tokenizer.Token.Id) TypeStore.Builder.Specifier {
+    return switch (id) {
+        .keyword_int8, .keyword_int8_2 => .char,
+        .keyword_int16, .keyword_int16_2 => .short,
+        .keyword_int32, .keyword_int32_2 => .int,
+        .keyword_int64, .keyword_int64_2 => .long_long,
+        else => unreachable,
+    };
+}
+
+fn getMSVCIntSuffixType(p: *Parser, bits: enum { @"8", @"16", @"32", @"64" }, signedness: std.builtin.Signedness) QualType {
+    return switch (bits) {
+        .@"8" => if (signedness == .signed) .char else .uchar,
+        .@"16" => p.comp.intLeastN(16, signedness),
+        .@"32" => p.comp.intLeastN(32, signedness),
+        .@"64" => if (p.comp.langopts.emulate != .msvc) p.comp.smallestNBitIntTargetIndependent(64, signedness) else if (signedness == .signed) .long_long else .ulong_long,
+    };
+}
+
 /// typeSpec
 ///  : keyword_void
 ///  | keyword_char
@@ -2233,11 +2286,21 @@ fn typeSpec(p: *Parser, builder: *TypeStore.Builder) Error!bool {
         switch (p.tok_ids[p.tok_i]) {
             .keyword_void => try builder.combine(.void, p.tok_i),
             .keyword_bool, .keyword_c23_bool => try builder.combine(.bool, p.tok_i),
-            .keyword_int8, .keyword_int8_2, .keyword_char => try builder.combine(.char, p.tok_i),
-            .keyword_int16, .keyword_int16_2, .keyword_short => try builder.combine(.short, p.tok_i),
-            .keyword_int32, .keyword_int32_2, .keyword_int => try builder.combine(.int, p.tok_i),
+            .keyword_char => try builder.combine(.char, p.tok_i),
+            .keyword_short => try builder.combine(.short, p.tok_i),
+            .keyword_int => try builder.combine(.int, p.tok_i),
             .keyword_long => try builder.combine(.long, p.tok_i),
-            .keyword_int64, .keyword_int64_2 => try builder.combine(.long_long, p.tok_i),
+
+            .keyword_int8,
+            .keyword_int8_2,
+            .keyword_int16,
+            .keyword_int16_2,
+            .keyword_int32,
+            .keyword_int32_2,
+            .keyword_int64,
+            .keyword_int64_2,
+            => |tok_id| try builder.combine(exactTypeKeywordToSpecMSVC(tok_id), p.tok_i),
+
             .keyword_int128 => try builder.combine(.int128, p.tok_i),
             .keyword_signed, .keyword_signed1, .keyword_signed2 => try builder.combine(.signed, p.tok_i),
             .keyword_unsigned => try builder.combine(.unsigned, p.tok_i),
@@ -3541,7 +3604,7 @@ const Declarator = struct {
                     if (elem_array_ty.len == .static) {
                         try p.err(source_tok, .static_non_outermost_array, .{});
                     }
-                    if (elem_qt.isQualified()) {
+                    if (elem_qt.isQualified() and elem_qt.type(p.comp) != .typedef) {
                         try p.err(source_tok, .qualifier_non_outermost_array, .{});
                     }
                 }
@@ -6306,9 +6369,13 @@ pub const Result = struct {
         }
         if (!lhs.qt.isInvalid()) {
             if (lhs.qt.get(p.comp, .vector)) |vec| {
-                if (!vec.elem.isInt(p.comp)) {
+                if (!vec.elem.isInt(p.comp) or vec.kind != .generic) {
                     lhs.qt = try p.comp.type_store.put(p.comp.gpa, .{
-                        .vector = .{ .elem = .int, .len = vec.len },
+                        .vector = .{
+                            .elem = p.comp.smallestNBitIntTargetIndependent(@intCast(vec.elem.bitSizeof(p.comp)), .signed),
+                            .len = vec.len,
+                            .kind = .generic,
+                        },
                     });
                 }
             } else {
@@ -6436,13 +6503,15 @@ pub const Result = struct {
         try a.lvalConversion(p, tok);
         try b.lvalConversion(p, tok);
 
-        const a_vec = a.qt.is(p.comp, .vector);
-        const b_vec = b.qt.is(p.comp, .vector);
-        if (a_vec and b_vec) {
+        const opt_a_vec = a.qt.get(p.comp, .vector);
+        const opt_b_vec = b.qt.get(p.comp, .vector);
+        if (opt_a_vec != null and opt_b_vec != null) {
+            const a_vec = opt_a_vec.?;
+            const b_vec = opt_b_vec.?;
             if (kind == .boolean_logic) {
                 return a.invalidBinTy(tok, b, p);
             }
-            if (a.qt.eql(b.qt, p.comp)) {
+            if (a_vec.eql(b_vec, p.comp, true) and a_vec.kind == .generic) {
                 return a.shouldEval(b, p);
             }
             if (a.qt.sizeCompare(b.qt, p.comp) == .eq) {
@@ -6455,8 +6524,8 @@ pub const Result = struct {
             b.val = .{};
             a.qt = .invalid;
             return false;
-        } else if (a_vec) {
-            if (b.coerceExtra(p, a.qt.childType(p.comp), tok, .test_coerce)) {
+        } else if (opt_a_vec) |a_vec| {
+            if (b.coerceExtra(p, a_vec.elem, tok, .test_coerce)) {
                 try b.saveValue(p);
                 b.qt = a.qt;
                 try b.implicitCast(p, .vector_splat, tok);
@@ -6465,8 +6534,8 @@ pub const Result = struct {
                 error.CoercionFailed => return a.invalidBinTy(tok, b, p),
                 else => |e| return e,
             }
-        } else if (b_vec) {
-            if (a.coerceExtra(p, b.qt.childType(p.comp), tok, .test_coerce)) {
+        } else if (opt_b_vec) |b_vec| {
+            if (a.coerceExtra(p, b_vec.elem, tok, .test_coerce)) {
                 try a.saveValue(p);
                 a.qt = b.qt;
                 try a.implicitCast(p, .vector_splat, tok);
@@ -6586,6 +6655,8 @@ pub const Result = struct {
                     return true;
                 }
                 if (a_sk.isPointer() and b_sk.isPointer()) return a.adjustCondExprPtrs(tok, b, p);
+
+                if (a.qt.is(p.comp, .storage_float) and a.qt.eql(b.qt, p.comp)) return true;
 
                 if (a.qt.getRecord(p.comp) != null and b.qt.getRecord(p.comp) != null and a.qt.eql(b.qt, p.comp)) {
                     return true;
@@ -7081,6 +7152,16 @@ pub const Result = struct {
         } else if (res.qt.is(p.comp, .void)) {
             try p.err(operand_tok, .invalid_cast_operand_type, .{res.qt});
             return error.ParsingFailed;
+        } else if (dest_qt.is(p.comp, .storage_float) or res.qt.is(p.comp, .storage_float)) {
+            if (dest_qt.is(p.comp, .storage_float) and dest_qt.eql(res.qt, p.comp)) {
+                cast_kind = .no_op;
+            } else if (dest_qt.is(p.comp, .storage_float)) {
+                try p.err(l_paren, .invalid_cast_type, .{dest_qt});
+                return error.ParsingFailed;
+            } else {
+                try p.err(operand_tok, .invalid_cast_operand_type, .{res.qt});
+                return error.ParsingFailed;
+            }
         } else if (dest_vec and src_vec) {
             if (dest_qt.eql(res.qt, p.comp)) {
                 cast_kind = .no_op;
@@ -7377,8 +7458,18 @@ pub const Result = struct {
         const dest_sk = dest_unqual.scalarKind(p.comp);
         const src_sk = res.qt.scalarKind(p.comp);
 
-        if (dest_qt.is(p.comp, .vector) and res.qt.is(p.comp, .vector)) {
-            if (dest_unqual.eql(res.qt, p.comp)) return;
+        if (dest_unqual.is(p.comp, .storage_float) and dest_unqual.eql(res.qt, p.comp)) {
+            return;
+        }
+
+        const dest_opt_vec = dest_qt.get(p.comp, .vector);
+        const res_opt_vec = res.qt.get(p.comp, .vector);
+
+        if (dest_opt_vec != null and res_opt_vec != null) {
+            const dest_vector = dest_opt_vec.?;
+            const res_vector = res_opt_vec.?;
+
+            if (dest_vector.eql(res_vector, p.comp, true)) return;
             if (dest_unqual.sizeCompare(res.qt, p.comp) == .eq) {
                 res.qt = dest_unqual;
                 return res.implicitCast(p, .bitcast, tok);
@@ -7407,6 +7498,10 @@ pub const Result = struct {
                 try res.castToFloat(p, dest_unqual, tok);
                 return;
             }
+        } else if (dest_unqual.is(p.comp, .storage_float)) {
+            // Storage floats are copy-only; conversions from other scalar types
+            // are diagnosed by the common switch statement below this
+            // large if/else block
         } else if (dest_sk.isPointer() and dest_sk != .block_pointer) {
             if (src_sk == .nullptr_t or res.val.isZero(p.comp)) {
                 try res.nullToPointer(p, dest_unqual, tok);
@@ -10591,21 +10686,34 @@ fn fixedSizeInt(p: *Parser, base: u8, buf: []const u8, suffix: NumberSuffix, tok
         .ULL, .IULL => .ulong_long,
         .L, .IL => .long,
         .LL, .ILL => .long_long,
+        .I8 => p.getMSVCIntSuffixType(.@"8", .signed),
+        .UI8 => p.getMSVCIntSuffixType(.@"8", .unsigned),
+        .I16 => p.getMSVCIntSuffixType(.@"16", .signed),
+        .UI16 => p.getMSVCIntSuffixType(.@"16", .unsigned),
+        .I32 => p.getMSVCIntSuffixType(.@"32", .signed),
+        .UI32 => p.getMSVCIntSuffixType(.@"32", .unsigned),
+        .I64 => p.getMSVCIntSuffixType(.@"64", .signed),
+        .UI64 => p.getMSVCIntSuffixType(.@"64", .unsigned),
         else => unreachable,
     };
 
-    for (qts) |qt| {
-        res.qt = qt;
-        if (res.qt.intRankOrder(suffix_qt, p.comp).compare(.lt)) continue;
-        const max_int = try Value.maxInt(res.qt, p.comp);
-        if (interned_val.compare(.lte, max_int, p.comp)) break;
-    } else switch (p.comp.langopts.emulate) {
-        .no, .gcc => if (p.comp.target.hasInt128()) {
-            res.qt = .int128;
-        } else {
-            res.qt = .long_long;
-        },
-        .msvc, .clang => res.qt = .ulong_long,
+    if (suffix.isMSVCExtension()) {
+        res.qt = suffix_qt; // No type promotion for MSVC suffixes
+        _ = try res.val.intCast(suffix_qt, p.comp); // No diagnostic for truncation or sign change for MSVC exact-width types
+    } else {
+        for (qts) |qt| {
+            res.qt = qt;
+            if (res.qt.intRankOrder(suffix_qt, p.comp).compare(.lt)) continue;
+            const max_int = try Value.maxInt(res.qt, p.comp);
+            if (interned_val.compare(.lte, max_int, p.comp)) break;
+        } else switch (p.comp.langopts.emulate) {
+            .no, .gcc => if (p.comp.target.hasInt128()) {
+                res.qt = .int128;
+            } else {
+                res.qt = .long_long;
+            },
+            .msvc, .clang => res.qt = .ulong_long,
+        }
     }
 
     res.node = try p.addNode(.{ .int_literal = .{ .qt = res.qt, .literal_tok = tok_i } });
@@ -10726,7 +10834,8 @@ fn getExponent(p: *Parser, buf: []const u8, prefix: NumberPrefix, tok_i: TokenIn
 /// to parse numbers in pragma handlers.
 pub fn parseNumberToken(p: *Parser, tok_i: TokenIndex) !Result {
     const buf = p.tokSlice(tok_i);
-    const prefix = NumberPrefix.fromString(buf);
+    const allow_fixed_size_int_suffixes = p.comp.langopts.allowFixedSizedIntSuffixes();
+    const prefix = NumberPrefix.fromString(buf, allow_fixed_size_int_suffixes);
     const after_prefix = buf[prefix.stringLen()..];
 
     const int_part = try p.getIntegerPart(after_prefix, prefix, tok_i);
@@ -10739,7 +10848,7 @@ pub fn parseNumberToken(p: *Parser, tok_i: TokenIndex) !Result {
     const exponent = try p.getExponent(after_frac, prefix, tok_i);
     const suffix_str = after_frac[exponent.len..];
     const is_float = (exponent.len > 0 or frac.len > 0);
-    const suffix = NumberSuffix.fromString(suffix_str, if (is_float) .float else .int) orelse {
+    const suffix = NumberSuffix.fromString(suffix_str, if (is_float) .float else .int, allow_fixed_size_int_suffixes) orelse {
         if (is_float) {
             try p.err(tok_i, .invalid_float_suffix, .{suffix_str});
         } else {

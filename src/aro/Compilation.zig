@@ -399,7 +399,9 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
         },
         .wasi => try define(w, "__wasi__"),
         .emscripten => try define(w, "__EMSCRIPTEN__"),
+        .serenity => try define(w, "__serenity__"),
         .@"3ds" => try define(w, "__3DS__"),
+        .psp => try define(w, "__PSP__"),
         .vita => try define(w, "__vita__"),
         else => {},
     }
@@ -681,15 +683,230 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
                 try define(w, "__sparcv8");
             }
         },
-        .arm, .armeb, .thumb, .thumbeb => {
+        .arm, .armeb, .thumb, .thumbeb => |arch| {
             try define(w, "__arm__");
             try define(w, "__arm");
-            if (target.cpu.arch.isThumb()) {
+            try define(w, "__ARM_32BIT_STATE");
+            try w.writeAll("#define __ARM_ACLE 200\n");
+
+            // see https://clang.llvm.org/doxygen/Basic_2Targets_2ARM_8cpp_source.html
+            // https://developer.arm.com/documentation/dui0774/g/chr1383660321827
+
+            // __ARM_ARCH_ISA_THUMB is defined to 2 if the core supports the Thumb-2 ISA.
+            if (target.cpu.has(.arm, .thumb2) or target.cpu.has(.arm, .thumb_mode)) {
                 try define(w, "__thumb__");
+                const num = if (target.cpu.has(.arm, .thumb2)) "2" else "1";
+                try w.print("#define __ARM_ARCH_ISA_THUMB {s}\n", .{num});
+            }
+
+            if (target.cpu.has(.arm, .vldn_align)) {
+                try define(w, "__ARM_FEATURE_UNALIGNED");
+            }
+
+            // ARM ISA means we are not M profile
+            if (!target.cpu.has(.arm, .mclass)) {
+                try define(w, "__ARM_ARCH_ISA_ARM");
+            }
+
+            const profile = if (target.cpu.has(.arm, .aclass))
+                "A"
+            else if (target.cpu.has(.arm, .rclass))
+                "R"
+            else if (target.cpu.has(.arm, .mclass))
+                "M"
+            else
+                "";
+
+            if (profile.len > 0) {
+                try w.print("#define __ARM_ARCH_PROFILE '{s}'\n", .{profile});
+            }
+
+            var arm_version: u8 = 6;
+            const arm_features = target.cpu.features;
+            for ([_]struct { std.Target.arm.Feature, []const u8 }{
+                .{ .v9_6a, "9_6A" },
+                .{ .v9_5a, "9_5A" },
+                .{ .v9_4a, "9_4A" },
+                .{ .v9_3a, "9_3A" },
+                .{ .v9_2a, "9_2A" },
+                .{ .v9_1a, "9_1A" },
+                .{ .v9a, "9A" },
+
+                .{ .v8_9a, "8_9A" },
+                .{ .v8_8a, "8_8A" },
+                .{ .v8_7a, "8_7A" },
+                .{ .v8_6a, "8_6A" },
+                .{ .v8_5a, "8_5A" },
+                .{ .v8_4a, "8_4A" },
+                .{ .v8_3a, "8_3A" },
+                .{ .v8_2a, "8_2A" },
+                .{ .v8_1a, "8_1A" },
+                .{ .v8_1m_main, "8_1M_MAIN" },
+                .{ .v8a, "8A" },
+                .{ .v8r, "8R" },
+                .{ .v8m_main, "8M_MAIN" },
+                .{ .v8m, "8M_BASE" },
+
+                .{ .v7ve, "7VE" },
+                .{ .v7a, "7A" },
+                .{ .v7r, "7R" },
+                .{ .v7m, "7M" },
+                .{ .v7em, "7EM" },
+
+                .{ .v6t2, "6T2" },
+                .{ .v6kz, "6KZ" },
+                .{ .v6k, "6K" },
+                .{ .v6j, "6J" },
+                .{ .v6sm, "6SM" },
+                .{ .v6m, "6M" },
+                .{ .v6, "6" },
+
+                .{ .v5tej, "5TEJ" },
+                .{ .v5te, "5TE" },
+                .{ .v5t, "5T" },
+
+                .{ .v4t, "4T" },
+                .{ .v4, "4" },
+
+                .{ .v3m, "3M" },
+                .{ .v3, "3" },
+
+                .{ .v2a, "2A" },
+                .{ .v2, "2" },
+            }) |fs| {
+                if (arm_features.isEnabled(@intFromEnum(fs[0]))) {
+                    try w.print("#define __ARM_ARCH_{s}__ 1\n", .{fs[1]});
+                    arm_version = fs[1][0] - '0';
+                    try w.print("#define __ARM_ARCH {d}\n", .{arm_version});
+                    break;
+                }
+            }
+
+            if (arm_version == 5 or (arm_version == 6 and !target.cpu.has(.arm, .mclass)) or arm_version > 6) {
+                try define(w, "__ARM_FEATURE_CLZ");
+            }
+
+            if (target.cpu.has(.arm, .dsp)) {
+                try define(w, "__ARM_FEATURE_DSP");
+            }
+
+            const is_thumb = arch == .thumb or arch == .thumbeb or target.cpu.has(.arm, .mclass);
+            if ((is_thumb and target.cpu.has(.arm, .hwdiv)) or
+                (!is_thumb and target.cpu.has(.arm, .hwdiv_arm)))
+            {
+                try define(w, "__ARM_FEATURE_IDIV");
+                try define(w, "__ARM_ARCH_EXT_IDIV__");
+            }
+            var sat = false;
+            if (arm_version == 6 and !target.cpu.has(.arm, .mclass) or arm_version > 6) {
+                try define(w, "__ARM_FEATURE_SAT");
+                sat = true;
+            }
+
+            if (target.cpu.has(.arm, .dsp) or sat) {
+                try define(w, "__ARM_FEATURE_QBIT");
+            }
+
+            if ((!target.cpu.has(.arm, .mclass) and arm_version >= 6) or
+                (target.cpu.has(.arm, .mclass) and target.cpu.has(.arm, .dsp)))
+            {
+                try define(w, "__ARM_FEATURE_SIMD32");
+            }
+
+            // See this: https://arm-software.github.io/acle/main/acle.html#ldrexstrex
+            // These constants define masks containing data sizes are suitable for __builtin_arm_ldrex and __builtin_arm_strex.
+            const ARM_LDREX_B: u4 = 1 << 0; // byte (8-bit)
+            const ARM_LDREX_H: u4 = 1 << 1; // half (16-bit)
+            const ARM_LDREX_W: u4 = 1 << 2; // word (32-bit)
+            const ARM_LDREX_D: u4 = 1 << 3; // double (64-bit)
+
+            const ldrex: u4 = switch (arm_version) {
+                6 => if (target.cpu.has(.arm, .mclass))
+                    0
+                else if (target.cpu.has(.arm, .v6k) or target.cpu.has(.arm, .v6kz))
+                    ARM_LDREX_D | ARM_LDREX_W | ARM_LDREX_H | ARM_LDREX_B
+                else
+                    ARM_LDREX_W,
+                7, 8 => if (target.cpu.has(.arm, .mclass))
+                    ARM_LDREX_W | ARM_LDREX_H | ARM_LDREX_B
+                else
+                    ARM_LDREX_D | ARM_LDREX_W | ARM_LDREX_H | ARM_LDREX_B,
+                9 => ARM_LDREX_D | ARM_LDREX_W | ARM_LDREX_H | ARM_LDREX_B,
+                else => 0,
+            };
+            if (ldrex != 0) {
+                try w.print("#define __ARM_FEATURE_LDREX 0x{x}\n", .{ldrex});
+            }
+
+            if (!target.cpu.has(.arm, .strict_align)) {
+                try define(w, "__ARM_FEATURE_UNALIGNED");
+            }
+
+            if (arch == .arm or arch == .thumb) {
+                try define(w, "__ARMEL__");
+            }
+
+            if (arch == .armeb or arch == .thumbeb) {
+                try define(w, "__ARMEB__");
+                try define(w, "__ARM_BIG_ENDIAN");
+            }
+            if (comp.code_gen_options.is_ropi) {
+                try define(w, "__ARM_ROPI");
+            }
+
+            if (comp.code_gen_options.is_rwpi) {
+                try define(w, "__ARM_RWPI");
             }
         },
         .aarch64, .aarch64_be => |arch| {
             try define(w, "__aarch64__");
+            try define(w, "__ARM_64BIT_STATE");
+            try define(w, "__ARM_ARCH_ISA_A64");
+            try w.writeAll("#define __ARM_ALIGN_MAX_STACK_PWR 4\n");
+
+            try define(w, "__ARM_FEATURE_CLZ");
+            try define(w, "__ARM_FEATURE_FMA");
+            try w.writeAll("#define __ARM_FEATURE_LDREX 0xF\n");
+            try define(w, "__ARM_FEATURE_IDIV");
+            try define(w, "__ARM_FEATURE_DIV");
+            try define(w, "__ARM_FEATURE_NUMERIC_MAXMIN");
+            try define(w, "__ARM_FEATURE_DIRECTED_ROUNDING");
+
+            try w.writeAll("#define __ARM_ACLE_VERSION(year,quarter,patch) (100 * (year) + 10 * (quarter) + (patch))\n");
+            const acle_version = (100 * 2024) + (10 * 2) + 0; // ACLE 2024.2
+            try w.print("#define __ARM_ACLE {d}\n", .{acle_version});
+
+            const arm_features = target.cpu.features;
+            for ([_]struct { std.Target.aarch64.Feature, []const u8 }{
+                .{ .v9_6a, "9_6A" },
+                .{ .v9_5a, "9_5A" },
+                .{ .v9_4a, "9_4A" },
+                .{ .v9_3a, "9_3A" },
+                .{ .v9_2a, "9_2A" },
+                .{ .v9_1a, "9_1A" },
+                .{ .v9a, "9A" },
+                .{ .v8_9a, "8_9A" },
+                .{ .v8_8a, "8_8A" },
+                .{ .v8_7a, "8_7A" },
+                .{ .v8_6a, "8_6A" },
+                .{ .v8_5a, "8_5A" },
+                .{ .v8_4a, "8_4A" },
+                .{ .v8_3a, "8_3A" },
+                .{ .v8_2a, "8_2A" },
+                .{ .v8_1a, "8_1A" },
+                .{ .v8a, "8A" },
+                .{ .v8r, "8R" },
+            }) |fs| {
+                if (arm_features.isEnabled(@intFromEnum(fs[0]))) {
+                    try w.print("#define __ARM_ARCH_{s}__ 1\n", .{fs[1]});
+                    const arm_version = fs[1][0];
+                    try w.print("#define __ARM_ARCH {c}\n", .{arm_version});
+                    const profile = fs[1][fs[1].len - 1];
+                    try w.print("#define __ARM_ARCH_PROFILE '{c}'\n", .{profile});
+                    break;
+                }
+            }
+
             switch (arch) {
                 .aarch64 => {
                     try define(w, "__AARCH64EL__");
@@ -1231,7 +1448,18 @@ pub fn float80Type(comp: *const Compilation) ?QualType {
     };
 }
 
-/// Smallest integer type with at least N bits
+/// target-independent lowest-rank integer type with at least N bits
+pub fn smallestNBitIntTargetIndependent(comp: *const Compilation, bits: usize, signedness: std.builtin.Signedness) QualType {
+    const candidates: [6]QualType = switch (signedness) {
+        .signed => .{ .schar, .short, .int, .long, .long_long, .int128 },
+        .unsigned => .{ .uchar, .ushort, .uint, .ulong, .ulong_long, .uint128 },
+    };
+    for (candidates) |qt| {
+        if (qt.bitSizeof(comp) >= bits) return qt;
+    } else unreachable;
+}
+
+/// Lowest-rank integer type with at least N bits; subject to platform idiosyncrasies
 pub fn intLeastN(comp: *const Compilation, bits: usize, signedness: std.builtin.Signedness) QualType {
     if (bits == 64 and (comp.target.os.tag.isDarwin() or comp.target.cpu.arch.isWasm())) {
         // WebAssembly and Darwin use `long long` for `int_least64_t` and `int_fast64_t`.
@@ -1241,13 +1469,7 @@ pub fn intLeastN(comp: *const Compilation, bits: usize, signedness: std.builtin.
         // AVR uses int for int_least16_t and int_fast16_t.
         return if (signedness == .signed) .int else .uint;
     }
-    const candidates: [5]QualType = switch (signedness) {
-        .signed => .{ .schar, .short, .int, .long, .long_long },
-        .unsigned => .{ .uchar, .ushort, .uint, .ulong, .ulong_long },
-    };
-    for (candidates) |qt| {
-        if (qt.bitSizeof(comp) >= bits) return qt;
-    } else unreachable;
+    return comp.smallestNBitIntTargetIndependent(bits, signedness);
 }
 
 fn generateFastOrLeastType(
@@ -2147,8 +2369,15 @@ pub fn findInclude(
     }) orelse return null;
     if (found.used_ms_search_rule) {
         const diagnostic: Diagnostic = .ms_search_rule;
+        var buf: [1024]u8 = undefined;
+        var bfa: std.heap.BufferFirstAllocator = .init(&buf, comp.gpa);
+        var allocating: std.Io.Writer.Allocating = .init(bfa.allocator());
+        defer allocating.deinit();
+
+        Diagnostics.formatArgs(&allocating.writer, diagnostic.fmt, .{filename}) catch return error.OutOfMemory;
+
         try comp.diagnostics.add(.{
-            .text = diagnostic.fmt,
+            .text = allocating.written(),
             .kind = diagnostic.kind,
             .opt = diagnostic.opt,
             .extension = diagnostic.extension,
