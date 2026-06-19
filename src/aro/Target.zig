@@ -1277,6 +1277,7 @@ pub fn toLLVMTriple(target: *const Target, buf: []u8) []const u8 {
         .opengl,
         .other,
         .plan9,
+        .psx,
         .psp,
         .tios,
         .vita,
