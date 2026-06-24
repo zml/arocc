@@ -1154,6 +1154,7 @@ fn restoreTokenState(pp: *Preprocessor, state: TokenState) void {
 fn expr(pp: *Preprocessor, tokenizer: *Tokenizer) MacroError!bool {
     const gpa = pp.comp.gpa;
     const token_state = pp.getTokenState();
+    const error_count = pp.diagnostics.errors;
     defer {
         for (pp.top_expansion_buf.items) |tok| TokenWithExpansionLocs.free(tok.expansion_locs, gpa);
         pp.restoreTokenState(token_state);
@@ -1266,6 +1267,7 @@ fn expr(pp: *Preprocessor, tokenizer: *Tokenizer) MacroError!bool {
         .tok_ids = pp.tokens.items(.id),
         .tok_i = @intCast(token_state.tokens_len),
         .in_macro = true,
+        .wip_attrs = .{},
 
         .tree = undefined,
         .labels = undefined,
@@ -1274,11 +1276,10 @@ fn expr(pp: *Preprocessor, tokenizer: *Tokenizer) MacroError!bool {
         .param_buf = undefined,
         .enum_buf = undefined,
         .record_buf = undefined,
-        .attr_buf = undefined,
         .string_ids = undefined,
     };
     defer parser.strings.deinit(gpa);
-    return parser.macroExpr();
+    return parser.macroExpr(pp.diagnostics.errors == error_count);
 }
 
 /// Turns macro_tok from .keyword_defined into .zero or .one depending on whether the argument is defined
@@ -1886,10 +1887,10 @@ fn handleBuiltinMacro(pp: *Preprocessor, builtin: Macro.Builtin.Func, param_toks
 
             const ident_str = pp.expandedSlice(identifier.?);
             return switch (builtin) {
-                .has_attribute => Attribute.fromString(.gnu, null, ident_str) != null,
+                .has_attribute => Attribute.Namespaced.fromString(.gnu, null, ident_str) != null,
                 .has_declspec_attribute => {
                     return if (pp.comp.langopts.declspec_attrs)
-                        Attribute.fromString(.declspec, null, ident_str) != null
+                        Attribute.Namespaced.fromString(.declspec, null, ident_str) != null
                     else
                         false;
                 },
@@ -1984,11 +1985,10 @@ fn expandFuncMacro(
     func_macro: *const Macro,
     args: *const MacroArguments,
     expanded_args: *const MacroArguments,
-    hideset_arg: Hideset.Index,
+    hideset: Hideset.Index,
     eval_ctx: EvalContext,
 ) MacroError!ExpandBuf {
     const gpa = pp.comp.gpa;
-    var hideset = hideset_arg;
     var buf: ExpandBuf = .empty;
     errdefer buf.deinit(gpa);
     try buf.ensureTotalCapacity(gpa, func_macro.tokens.len);
@@ -2046,17 +2046,11 @@ fn expandFuncMacro(
                 if (next.len != 0) break;
             },
             .macro_param_no_expand => {
-                if (tok_i + 1 < func_macro.tokens.len and func_macro.tokens[tok_i + 1].id == .hash_hash) {
-                    hideset = .none;
-                }
                 const slice = getPasteArgs(args.items[raw.end]);
                 const raw_loc = Source.Location{ .id = raw.source, .byte_offset = raw.start, .line = raw.line };
                 try bufCopyTokens(gpa, &buf, slice, &.{raw_loc});
             },
             .macro_param => {
-                if (tok_i + 1 < func_macro.tokens.len and func_macro.tokens[tok_i + 1].id == .hash_hash) {
-                    hideset = .none;
-                }
                 const arg = expanded_args.items[raw.end];
                 const raw_loc = Source.Location{ .id = raw.source, .byte_offset = raw.start, .line = raw.line };
                 try bufCopyTokens(gpa, &buf, arg, &.{raw_loc});
@@ -2155,14 +2149,13 @@ fn expandFuncMacro(
                         if (vendor_ident) |some| {
                             const vendor_str = pp.expandedSlice(some);
                             const attr_str = pp.expandedSlice(attr_ident.?);
-                            const exists = Attribute.fromString(.gnu, vendor_str, attr_str) != null;
+                            const exists = Attribute.Namespaced.fromString(.standard, vendor_str, attr_str) != null;
 
                             const start = pp.comp.generated_buf.items.len;
                             try pp.comp.generated_buf.appendSlice(gpa, if (exists) "1\n" else "0\n");
                             try buf.append(gpa, try pp.makeGeneratedToken(start, .pp_num, tokFromRaw(raw)));
                             continue;
                         }
-                        if (!pp.comp.langopts.standard.atLeast(.c23)) break :res not_found;
 
                         const attrs = std.StaticStringMap([]const u8).initComptime(.{
                             .{ "deprecated", "201904L\n" },
@@ -2704,7 +2697,7 @@ fn expandMacroExhaustive(
                         .none
                     else
                         try pp.hideset.intersection(macro_hidelist, r_paren_hidelist);
-                    hs = try pp.hideset.prepend(macro_tok.loc, hs);
+                    hs = try pp.hideset.prepend(macro_tok.loc, @intCast(expanded.len), hs);
 
                     var args_count: u32 = @intCast(args.items.len);
                     // if the macro has zero arguments g() args_count is still 1
@@ -2768,7 +2761,7 @@ fn expandMacroExhaustive(
                     var res = try pp.expandObjMacro(macro);
                     defer res.deinit(gpa);
 
-                    const hs = try pp.hideset.prepend(macro_tok.loc, macro_hidelist);
+                    const hs = try pp.hideset.prepend(macro_tok.loc, @intCast(expanded.len), macro_hidelist);
 
                     const macro_expansion_locs = macro_tok.expansionSlice();
                     var increment_idx_by = res.items.len;

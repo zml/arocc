@@ -385,7 +385,7 @@ pub fn parseArgs(
             } else if (mem.eql(u8, arg, "-fapple-kext")) {
                 d.apple_kext = true;
             } else if (option(arg, "-fvisibility=")) |visibility| {
-                d.comp.langopts.default_symbol_visibility = Attribute.visibilityFromString(visibility) orelse
+                d.comp.langopts.default_symbol_visibility = Attribute.Args.Visibility.opts.map.get(visibility) orelse
                     return d.fatal("unsupported value '{s}'' in '{s}'", .{ visibility, arg });
             } else if (option(arg, "-frandom-seed=")) |_| {
                 // Ignore
@@ -875,6 +875,7 @@ pub fn parseArgs(
         if (d.raw_darwin_variant_target_triple) |darwin_triple| {
             d.comp.darwin_target_variant = try d.parseTarget(darwin_triple, null);
         }
+        d.comp.langopts.setTargetOptions(d.comp.target);
     }
     if (emulate != null or d.raw_target_triple != null) {
         d.comp.langopts.setEmulatedCompiler(emulate orelse d.comp.target.systemCompiler());

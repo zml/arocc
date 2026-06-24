@@ -10,6 +10,8 @@ const builtin = @import("builtin");
 const LangOpts = @import("LangOpts.zig");
 const QualType = @import("TypeStore.zig").QualType;
 
+const assert = std.debug.assert;
+
 pub const Vendor = enum {
     apple,
     pc,
@@ -601,6 +603,12 @@ pub fn hasHalfPrecisionFloatABI(target: *const Target) bool {
 
 pub fn hasAArch64ACLETypes(target: *const Target) bool {
     return target.cpu.arch.isAARCH64();
+}
+
+pub fn hasProtectedVisibility(target: *const Target) bool {
+    if (target.cpu.arch.isWasm()) return false;
+    if (target.ofmt == .macho) return false;
+    return true;
 }
 
 pub const FPSemantics = enum {
@@ -1277,8 +1285,8 @@ pub fn toLLVMTriple(target: *const Target, buf: []u8) []const u8 {
         .opengl,
         .other,
         .plan9,
-        .psx,
         .psp,
+        .psx,
         .tios,
         .vita,
         => "unknown",
@@ -1585,7 +1593,13 @@ test "alignment functions - smoke test" {
 }
 
 test "target size/align tests" {
-    var comp: @import("Compilation.zig") = undefined;
+    var comp: @import("Compilation.zig") = .{
+        .gpa = undefined,
+        .arena = undefined,
+        .io = undefined,
+        .cwd = undefined,
+        .diagnostics = undefined,
+    };
 
     const linux: Os = .{ .tag = .linux, .version_range = .{ .none = {} } };
     const x86_target: Target = .{
@@ -1792,6 +1806,71 @@ pub fn parseOs(result: *std.Target.Query, text: []const u8, version_string: ?*[]
             }
         },
     };
+}
+
+pub fn armVersion(target: Target) ?struct { version: u8, string: []const u8 } {
+    assert(target.cpu.arch.isArm());
+    for ([_]struct { std.Target.arm.Feature, []const u8 }{
+        .{ .v9_6a, "9_6A" },
+        .{ .v9_5a, "9_5A" },
+        .{ .v9_4a, "9_4A" },
+        .{ .v9_3a, "9_3A" },
+        .{ .v9_2a, "9_2A" },
+        .{ .v9_1a, "9_1A" },
+        .{ .v9a, "9A" },
+
+        .{ .v8_9a, "8_9A" },
+        .{ .v8_8a, "8_8A" },
+        .{ .v8_7a, "8_7A" },
+        .{ .v8_6a, "8_6A" },
+        .{ .v8_5a, "8_5A" },
+        .{ .v8_4a, "8_4A" },
+        .{ .v8_3a, "8_3A" },
+        .{ .v8_2a, "8_2A" },
+        .{ .v8_1a, "8_1A" },
+        .{ .v8_1m_main, "8_1M_MAIN" },
+        .{ .v8a, "8A" },
+        .{ .v8r, "8R" },
+        .{ .v8m_main, "8M_MAIN" },
+        .{ .v8m, "8M_BASE" },
+
+        .{ .v7ve, "7VE" },
+        .{ .v7a, "7A" },
+        .{ .v7r, "7R" },
+        .{ .v7m, "7M" },
+        .{ .v7em, "7EM" },
+        .{ .has_v7, "7A" }, // bare armv7 with no profile: default to A
+
+        .{ .v6t2, "6T2" },
+        .{ .v6kz, "6KZ" },
+        .{ .v6k, "6K" },
+        .{ .v6j, "6J" },
+        .{ .v6sm, "6SM" },
+        .{ .v6m, "6M" },
+        .{ .v6, "6" },
+
+        .{ .v5tej, "5TEJ" },
+        .{ .v5te, "5TE" },
+        .{ .v5t, "5T" },
+
+        .{ .v4t, "4T" },
+        .{ .v4, "4" },
+
+        .{ .v3m, "3M" },
+        .{ .v3, "3" },
+
+        .{ .v2a, "2A" },
+        .{ .v2, "2" },
+    }) |fs| {
+        if (target.cpu.features.isEnabled(@intFromEnum(fs[0]))) {
+            return .{
+                .version = fs[1][0] - '0',
+                .string = fs[1],
+            };
+        }
+    }
+
+    return null;
 }
 
 test parseOs {

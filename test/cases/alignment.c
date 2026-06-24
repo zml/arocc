@@ -9,7 +9,7 @@ int baz(_Alignas(8) int d) {
     return _Alignof(_Alignas(8) int);
 }
 
-_Alignas(536870912) int e;
+_Alignas(4294967297) int e;
 _Alignas(-2) int f;
 
 _Alignas(c) int x;
@@ -48,20 +48,30 @@ void array_fixed(void) {
     _Static_assert(_Alignof(__typeof(a)) == 32, "");
 }
 
+void array_element_typedef(void) {
+    typedef int pair[2];
+    typedef pair elem __attribute__((aligned(8)));
+    typedef elem arr[3];
+    arr a = {{1, 2}, {3, 4}, {5, 6}};
+    _Static_assert(_Alignof(arr) == 8, "");
+    _Static_assert(_Alignof(__typeof(a)) == 8, "");
+}
+
 /** manifest:
 syntax
 args = -Wno-implicit-int
 
 alignment.c:1:1: error: '_Alignas' attribute only applies to variables and fields
 alignment.c:3:3: error: '_Alignas' attribute only applies to variables and fields
+alignment.c:4:1: error: requested alignment is not a power of 2
 alignment.c:5:1: error: requested alignment is less than minimum alignment of 4
-alignment.c:6:10: error: requested alignment is not a power of 2
+alignment.c:6:1: error: requested alignment is not a power of 2
 alignment.c:8:9: error: '_Alignas' attribute cannot be applied to a function parameter
-alignment.c:9:21: warning: '_Alignas' attribute is ignored here
-alignment.c:12:10: error: requested alignment of 536870912 is too large
-alignment.c:13:10: error: requested negative alignment of -2 is invalid
-alignment.c:15:10: error: '_Alignas' attribute requires integer constant expression
-alignment.c:35:24: error: '_Alignas' attribute requires integer constant expression
+alignment.c:9:21: warning: '_Alignas' attribute ignored when parsing type [-Wignored-attributes]
+alignment.c:12:1: error: requested alignment of 4294967297 is too large
+alignment.c:13:1: error: requested negative alignment of -2 is invalid
+alignment.c:15:10: error: expected an integer constant as argmuent of '_Alignas' attribute but got an expression
+alignment.c:35:24: error: expected an integer constant as argmuent of 'aligned' attribute but got a string
 alignment.c:36:10: error: expression is not an integer constant expression
 */
 
