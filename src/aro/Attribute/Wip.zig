@@ -597,6 +597,15 @@ fn applyAlignment(wip: *Wip) !void {
         }
         casted = @intCast(requested);
     }
+    if (comp.langopts.emulate == .msvc) {
+        switch (wip.current.node()) {
+            .enum_forward_decl, .enum_decl => {
+                try wip.err(.msvc_enum_align_ignored, .{});
+                return;
+            },
+            else => {},
+        }
+    }
     try wip.addAlignmentToTypeMap(casted);
     try wip.add(.{ .alignment = casted });
 }
@@ -1212,6 +1221,14 @@ fn applyCallingConvention(wip: *Wip) !void {
     }
     func.cc = cc;
 
+    // We cannot pass the function type directly here because the pointer to
+    // type_store.extra might get invalidated while setting the updated type.
+    const lb = &wip.current.parser.list_buf;
+    const list_buf_top = lb.items.len;
+    defer lb.items.len = list_buf_top;
+    try lb.appendSlice(comp.gpa, @ptrCast(func.params));
+    func.params = @ptrCast(lb.items[list_buf_top..]);
+
     // TODO this can overwrite a typedef
     // typedef void (*fn_ptr)(void);
     // __cdecl fn_ptr a;
@@ -1226,6 +1243,11 @@ fn applyNullability(wip: *Wip) !void {
 
     const comp = wip.current.parser.comp;
     var pointer: Type.Pointer = qt.get(comp, .pointer) orelse {
+        if (wip.current.target == null and qt.is(comp, .array)) {
+            attr.used_as_type_attr = false;
+            return;
+        }
+
         try wip.err(.invalid_nullability, .{qt});
         return;
     };
