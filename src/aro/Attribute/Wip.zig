@@ -435,6 +435,15 @@ pub fn applyDeclAttrsExtra(
                 .always_inline => try wip.applyAlwaysInline(),
                 .gnu_inline => try wip.applyGnuInline(),
                 .section => try wip.applySection(),
+                .weak => {
+                    if (try wip.checkTarget(&.{ .function, .variable })) continue;
+                    if (try wip.argCount(0)) continue;
+                    try wip.add(.weak);
+                },
+                .selectany => {
+                    if (try wip.argCount(0)) continue;
+                    try wip.add(.selectany);
+                },
                 else => {
                     try wip.err(.unimplemented, .{attr});
                 },
@@ -453,6 +462,11 @@ pub fn applyDeclAttrsExtra(
                 .vectorcall,
                 => try wip.applyCallingConvention(),
                 .always_inline => try wip.applyAlwaysInline(),
+                .internal_linkage => {
+                    if (try wip.checkTarget(&.{ .function, .variable })) continue;
+                    if (try wip.argCount(0)) continue;
+                    try wip.add(.internal_linkage);
+                },
                 else => {
                     try wip.err(.unimplemented, .{attr});
                 },
@@ -465,6 +479,10 @@ pub fn applyDeclAttrsExtra(
                 .deprecated => try wip.applyDeprecated(),
                 .noreturn => try wip.applyNoreturn(),
                 .allocate => try wip.applySection(),
+                .selectany => {
+                    if (try wip.argCount(0)) continue;
+                    try wip.add(.selectany);
+                },
                 else => {
                     try wip.err(.unimplemented, .{attr});
                 },
@@ -500,6 +518,8 @@ pub fn applyDeclAttrsExtra(
         }
     }
 
+    try wip.checkLinkageAttrs();
+
     try wip.addAppliedAttrs();
 }
 
@@ -532,6 +552,55 @@ fn inherit(wip: *Wip, p: *Parser, decl: Tree.Node.Index) !void {
 
         try wip.applied.append(gpa, ref);
     }
+}
+
+fn checkLinkageAttrs(wip: *Wip) !void {
+    const am = &wip.current.parser.tree.attr_map;
+
+    const internal_linkage = blk: {
+        for (wip.applied.items) |ref| {
+            const attr = am.get(ref);
+            if (attr.args == .internal_linkage) break :blk true;
+        }
+
+        break :blk switch (wip.current.node()) {
+            .function => |function| function.static,
+            .variable => |variable| switch (variable.storage_class) {
+                .static => true,
+                .@"extern" => false,
+                .auto, .register => wip.current.parser.func.qt != null,
+            },
+            else => false,
+        };
+    };
+
+    const remove_weak = internal_linkage;
+    const remove_selectany = internal_linkage or wip.current.node() == .function;
+
+    var err_weak = false;
+    var err_selectany = false;
+
+    var i: usize = 0;
+    for (wip.applied.items) |ref| {
+        const attr = am.get(ref);
+        if (attr.args == .weak and remove_weak) {
+            if (!err_weak) {
+                try wip.errTok(attr.tok, .invalid_weak, .{attr});
+                err_weak = true;
+            }
+            continue;
+        }
+        if (attr.args == .selectany and remove_selectany) {
+            if (!err_selectany) {
+                try wip.errTok(attr.tok, .invalid_selectany, .{attr});
+                err_selectany = true;
+            }
+            continue;
+        }
+        wip.applied.items[i] = ref;
+        i += 1;
+    }
+    wip.applied.items.len = i;
 }
 
 fn applyAlignment(wip: *Wip) !void {
@@ -1241,17 +1310,6 @@ fn applyNullability(wip: *Wip) !void {
     const qt = wip.current.qt;
     if (qt.isInvalid()) return;
 
-    const comp = wip.current.parser.comp;
-    var pointer: Type.Pointer = qt.get(comp, .pointer) orelse {
-        if (wip.current.target == null and qt.is(comp, .array)) {
-            attr.used_as_type_attr = false;
-            return;
-        }
-
-        try wip.err(.invalid_nullability, .{qt});
-        return;
-    };
-
     const new_nullability: Type.Pointer.Nullability = switch (attr.name.keyword) {
         .nonnull => .nonnull,
         .null_unspecified => .unspecified,
@@ -1259,13 +1317,32 @@ fn applyNullability(wip: *Wip) !void {
         .nullable => .nullable,
         else => unreachable,
     };
-    if (pointer.nullability != .default and pointer.nullability != new_nullability) {
-        try wip.err(.conflicting_nullability, .{ new_nullability.str(), pointer.nullability.str() });
-        return;
-    }
 
-    pointer.nullability = new_nullability;
-    wip.current.qt = try comp.type_store.put(comp.gpa, .{ .pointer = pointer });
+    const comp = wip.current.parser.comp;
+    var base_type = qt.base(comp).type;
+    switch (base_type) {
+        inline .pointer, .block => |*bt, tag| {
+            if (bt.nullability != .default and bt.nullability != new_nullability) {
+                try wip.err(.conflicting_nullability, .{ new_nullability.str(), bt.nullability.str() });
+                return;
+            }
+
+            bt.nullability = new_nullability;
+            wip.current.qt = try comp.type_store.put(
+                comp.gpa,
+                @unionInit(TypeStore.Type, @tagName(tag), bt.*),
+            );
+        },
+        else => {
+            if (wip.current.target == null and qt.is(comp, .array)) {
+                attr.used_as_type_attr = false;
+                return;
+            }
+
+            try wip.err(.invalid_nullability, .{qt});
+            return;
+        },
+    }
 }
 
 pub fn applyStmtAttrs(wip: *Wip, p: *Parser, stmt: Tree.Node.Index) !void {
