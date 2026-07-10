@@ -226,6 +226,7 @@ const Target = enum {
     tag,
     field,
     typedef,
+    function_type,
 
     pub fn str(t: Target) []const u8 {
         return switch (t) {
@@ -239,6 +240,7 @@ const Target = enum {
             .tag => "tag types",
             .field => "fields",
             .typedef => "typedefs",
+            .function_type => "functions and function pointers",
         };
     }
 };
@@ -302,6 +304,13 @@ fn checkTarget(wip: *Wip, list: []const Target) !bool {
             .typedef => return false,
             else => {},
         },
+        .function_type => {
+            const comp = wip.current.parser.comp;
+            const qt = wip.current.qt;
+
+            const base_qt = if (qt.get(comp, .pointer)) |pointer| pointer.child else qt;
+            if (base_qt.is(comp, .func)) return false;
+        },
     };
 
     try wip.err(.invalid_target, .{ wip.current.attr, Parser.Choices(Target).init(list, null) });
@@ -336,7 +345,7 @@ fn add(wip: *Wip, args: Attribute.Args) !void {
     try wip.applied.append(gpa, ref);
 }
 
-pub fn applyDeclAttrs(wip: *Wip, p: *Parser, decl: Tree.Node.Index, prev_decl: Tree.Node.OptIndex) !void {
+pub fn applyDeclAttrs(wip: *Wip, p: *Parser, decl: Tree.Node.Index, prev_decl: ?Tree.Node.Index) !void {
     return wip.applyDeclAttrsExtra(p, decl, decl.qt(&p.tree), prev_decl);
 }
 
@@ -345,7 +354,7 @@ pub fn applyDeclAttrsExtra(
     p: *Parser,
     decl: Tree.Node.Index,
     qt: QualType,
-    prev_decl: Tree.Node.OptIndex,
+    prev_decl: ?Tree.Node.Index,
 ) !void {
     wip.applied.items.len = 0;
     wip.current = .{
@@ -355,7 +364,7 @@ pub fn applyDeclAttrsExtra(
         .parser = p,
     };
 
-    if (prev_decl.unpack()) |prev| try wip.inherit(p, prev);
+    if (prev_decl) |prev| try wip.inherit(p, prev);
 
     for (wip.attrs.items[wip.top..]) |*attr| {
         if (attr.used_as_type_attr) continue;
@@ -367,9 +376,19 @@ pub fn applyDeclAttrsExtra(
                 .deprecated => try wip.applyDeprecated(),
                 .nodiscard => try wip.applyWarnUnusedResult(),
                 .noreturn, ._Noreturn => try wip.applyNoreturn(),
-                else => {
-                    try wip.err(.unimplemented, .{attr});
+                .maybe_unused => try wip.applyUnused(),
+                .unsequenced => {
+                    if (try wip.checkTarget(&.{.function_type})) continue;
+                    if (try wip.argCount(0)) continue;
+                    try wip.add(.unsequenced);
                 },
+                .reproducible => {
+                    if (try wip.checkTarget(&.{.function_type})) continue;
+                    if (try wip.argCount(0)) continue;
+                    try wip.add(.reproducible);
+                },
+
+                .fallthrough => try wip.err(.stmt_attr_on_decl, .{attr}),
             },
             .gnu => |gnu_attr| switch (gnu_attr) {
                 .@"packed" => {
@@ -444,9 +463,12 @@ pub fn applyDeclAttrsExtra(
                     if (try wip.argCount(0)) continue;
                     try wip.add(.selectany);
                 },
+                .unused => try wip.applyUnused(),
                 else => {
                     try wip.err(.unimplemented, .{attr});
                 },
+
+                .fallthrough => try wip.err(.stmt_attr_on_decl, .{attr}),
             },
             .clang => |clang_attr| switch (clang_attr) {
                 .unavailable => {
@@ -953,6 +975,12 @@ fn applySection(wip: *Wip) !void {
     try wip.add(.{ .section = section_name });
 }
 
+fn applyUnused(wip: *Wip) !void {
+    if (try wip.checkTarget(&.{ .function, .variable, .param, .typedef, .tag, .field, .label })) return;
+    if (try wip.argCount(0)) return;
+    try wip.add(.unused);
+}
+
 pub fn applyTypeAttrs(wip: *Wip, p: *Parser, qt: QualType) !QualType {
     wip.current = .{
         .attr = undefined,
@@ -1372,6 +1400,24 @@ pub fn applyStmtAttrs(wip: *Wip, p: *Parser, stmt: Tree.Node.Index) !void {
                     continue;
                 },
                 .always_inline => {}, // invalid, use clang::always_inline
+                .cold => {
+                    if (try wip.checkTarget(&.{.label})) continue;
+                    if (try wip.argCount(0)) continue;
+                    try wip.incompatible(.hot);
+                    try wip.add(.cold);
+                    continue;
+                },
+                .hot => {
+                    if (try wip.checkTarget(&.{.label})) continue;
+                    if (try wip.argCount(0)) continue;
+                    try wip.incompatible(.cold);
+                    try wip.add(.hot);
+                    continue;
+                },
+                .unused => {
+                    try wip.applyUnused();
+                    continue;
+                },
                 else => {},
             },
             .clang => |clang_attr| switch (clang_attr) {
