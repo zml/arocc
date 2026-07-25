@@ -152,6 +152,7 @@ extension_suppressed: bool = false,
 contains_address_of_label: bool = false,
 label_count: u32 = 0,
 const_decl_folding: ConstDeclFoldingMode = .fold_const_decls,
+record_static_assert_eval_note: bool = false,
 /// location of first computed goto in function currently being parsed
 /// if a computed goto is used, the function must contain an
 /// address-of-label expression (tracked with contains_address_of_label)
@@ -331,7 +332,7 @@ fn validateExtendedIdentifier(p: *Parser) !bool {
         // Check NFC normalization.
         if (!normalized) continue;
         const canonical_class = char_info.getCanonicalClass(codepoint);
-        if (@intFromEnum(last_canonical_class) > @intFromEnum(canonical_class) and
+        if (@backingInt(last_canonical_class) > @backingInt(canonical_class) and
             canonical_class != .not_reordered)
         {
             normalized = false;
@@ -527,7 +528,7 @@ fn formatResult(p: *Parser, w: *std.Io.Writer, fmt: []const u8, res: Result) !us
         .null => try w.writeAll("nullptr_t"),
         else => if (try res.val.print(res.qt, p.comp, w)) |nested| switch (nested) {
             .pointer => |ptr| {
-                const ptr_node: Node.Index = @enumFromInt(ptr.node);
+                const ptr_node: Node.Index = @fromBackingInt(ptr.node);
                 const decl_name = p.tree.tokSlice(ptr_node.tok(&p.tree));
                 try ptr.offset.printPointer(decl_name, p.comp, w);
             },
@@ -787,16 +788,16 @@ fn addList(p: *Parser, nodes: []const Node.Index) Allocator.Error!Tree.Node.Rang
 
 /// Recursively sets the defintion field of `tentative_decl` to `definition`.
 pub fn setTentativeDeclDefinition(p: *Parser, tentative_decl: Node.Index, definition: Node.Index) void {
-    const node_data = &p.tree.nodes.items(.data)[@intFromEnum(tentative_decl)];
-    switch (p.tree.nodes.items(.tag)[@intFromEnum(tentative_decl)]) {
+    const node_data = &p.tree.nodes.items(.data)[@backingInt(tentative_decl)];
+    switch (p.tree.nodes.items(.tag)[@backingInt(tentative_decl)]) {
         .fn_proto => {},
         .variable => {},
         else => return,
     }
 
-    const prev: Node.OptIndex = @enumFromInt(node_data[2]);
+    const prev: Node.OptIndex = @fromBackingInt(node_data[2]);
 
-    node_data[2] = @intFromEnum(definition);
+    node_data[2] = @backingInt(definition);
     if (prev.unpack()) |some| {
         p.setTentativeDeclDefinition(some, definition);
     }
@@ -815,30 +816,30 @@ fn finalizeTentativeDefinitions(p: *Parser) Allocator.Error!void {
     while (i > 0) {
         i -= 1;
         const root_decl = p.tree.root_decls.items[i];
-        switch (tags[@intFromEnum(root_decl)]) {
+        switch (tags[@backingInt(root_decl)]) {
             .fn_proto => {
-                const node_data = &data[@intFromEnum(root_decl)];
-                if (node_data[2] != @intFromEnum(Node.OptIndex.null)) {
+                const node_data = &data[@backingInt(root_decl)];
+                if (node_data[2] != @backingInt(Node.OptIndex.null)) {
                     if (tags[node_data[2]] != .fn_def) {
-                        node_data[2] = @intFromEnum(Node.OptIndex.null);
+                        node_data[2] = @backingInt(Node.OptIndex.null);
                     }
                 }
             },
             .variable => {
                 const variable = root_decl.get(&p.tree).variable;
-                const node_data = &data[@intFromEnum(root_decl)];
+                const node_data = &data[@backingInt(root_decl)];
                 if (variable.storage_class != .@"extern") {
                     const name = try p.comp.internString(p.tree.tokSlice(variable.name_tok));
                     const gop = try finalized.getOrPut(p.comp.gpa, name);
-                    if (!gop.found_existing and (node_data[2] == @intFromEnum(Node.OptIndex.null) or tags[node_data[2]] != .variable_def)) {
+                    if (!gop.found_existing and (node_data[2] == @backingInt(Node.OptIndex.null) or tags[node_data[2]] != .variable_def)) {
                         p.setTentativeDeclDefinition(root_decl, root_decl);
                     }
                 }
-                if (node_data[2] != @intFromEnum(Node.OptIndex.null)) {
-                    if (node_data[2] == @intFromEnum(root_decl) or
-                        (tags[node_data[2]] != .variable_def and !p.isTentativeDefinitionNode(@enumFromInt(node_data[2]))))
+                if (node_data[2] != @backingInt(Node.OptIndex.null)) {
+                    if (node_data[2] == @backingInt(root_decl) or
+                        (tags[node_data[2]] != .variable_def and !p.isTentativeDefinitionNode(@fromBackingInt(node_data[2]))))
                     {
-                        node_data[2] = @intFromEnum(Node.OptIndex.null);
+                        node_data[2] = @backingInt(Node.OptIndex.null);
                     }
                 }
             },
@@ -922,7 +923,7 @@ fn pragma(p: *Parser) Compilation.Error!bool {
         const name_tok = p.tok_i;
         const name = p.tokSlice(name_tok);
 
-        const end_idx = mem.indexOfScalarPos(Token.Id, p.tok_ids, p.tok_i, .nl).?;
+        const end_idx = mem.findScalarPos(Token.Id, p.tok_ids, p.tok_i, .nl).?;
         const pragma_len = @as(TokenIndex, @intCast(end_idx)) - p.tok_i;
         defer p.tok_i += pragma_len + 1; // skip past .nl as well
         if (p.comp.getPragma(name)) |prag| {
@@ -1573,7 +1574,7 @@ fn decl(p: *Parser) Error!bool {
         };
 
         try decl_spec.validateFnDef(p);
-        try p.tree.setNode(.{ .function = function }, @intFromEnum(decl_node));
+        try p.tree.setNode(.{ .function = function }, @backingInt(decl_node));
         try p.wip_attrs.applyDeclAttrs(p, decl_node, previous_decl);
 
         p.local_unused_err_count = p.diagnostics.errors;
@@ -1582,7 +1583,7 @@ fn decl(p: *Parser) Error!bool {
             try p.err(p.tok_i, .expected_fn_body, .{});
             return true;
         };
-        try p.tree.setNode(.{ .function = function }, @intFromEnum(decl_node));
+        try p.tree.setNode(.{ .function = function }, @backingInt(decl_node));
 
         try p.decl_buf.append(gpa, decl_node);
 
@@ -1615,7 +1616,7 @@ fn decl(p: *Parser) Error!bool {
                 .name_tok = init_d.d.name,
                 .qt = init_d.d.qt,
                 .implicit = false,
-            } }, @intFromEnum(decl_node));
+            } }, @backingInt(decl_node));
         } else if (init_d.d.declarator_type == .func or init_d.d.qt.is(p.comp, .func)) {
             try decl_spec.validateFnDecl(p);
             try p.tree.setNode(.{ .function = .{
@@ -1625,7 +1626,7 @@ fn decl(p: *Parser) Error!bool {
                 .@"inline" = decl_spec.@"inline" != null,
                 .body = null,
                 .definition = null,
-            } }, @intFromEnum(decl_node));
+            } }, @backingInt(decl_node));
         } else {
             try decl_spec.validateDecl(p, init_d.asm_label);
             var node_qt = init_d.d.qt;
@@ -1657,7 +1658,7 @@ fn decl(p: *Parser) Error!bool {
                     .initializer = if (init_d.initializer) |some| some.node else null,
                     .definition = null,
                 },
-            }, @intFromEnum(decl_node));
+            }, @backingInt(decl_node));
         }
         try p.decl_buf.append(gpa, decl_node);
 
@@ -1730,32 +1731,68 @@ fn decl(p: *Parser) Error!bool {
     return true;
 }
 
-fn staticAssertMessage(p: *Parser, cond_node: Node.Index, maybe_message: ?Result, allocating: *std.Io.Writer.Allocating) !?[]const u8 {
+const StaticAsssertMessage = struct {
+    full: []const u8,
+    req_start: u32,
+    req_end: u32,
+};
+
+fn staticAssertMessage(p: *Parser, cond: Node.Index, maybe_message: ?Result, allocating: *std.Io.Writer.Allocating) !StaticAsssertMessage {
     const w = &allocating.writer;
 
-    const cond = cond_node.get(&p.tree);
-    if (cond == .builtin_types_compatible_p) {
-        try w.writeAll("'__builtin_types_compatible_p(");
-
-        const lhs_ty = cond.builtin_types_compatible_p.lhs;
-        try lhs_ty.print(p.comp, w);
-        try w.writeAll(", ");
-
-        const rhs_ty = cond.builtin_types_compatible_p.rhs;
-        try rhs_ty.print(p.comp, w);
-
-        try w.writeAll(")'");
-    } else if (maybe_message == null) return null;
+    try w.writeAll(" due to requirement '");
+    const start = allocating.written().len;
+    try p.tree.write(cond, w);
+    const end = allocating.written().len;
+    try w.writeByte('\'');
 
     if (maybe_message) |message| {
-        assert(message.node.get(&p.tree) == .string_literal_expr);
-        if (allocating.written().len > 0) {
-            try w.writeByte(' ');
-        }
         const bytes = p.comp.interner.get(message.val.ref()).bytes;
-        try Value.printString(bytes, message.qt, p.comp, w);
+        const size: Compilation.CharUnitSize = @fromBackingInt(@intCast(message.qt.childType(p.comp).sizeof(p.comp)));
+        if (bytes.len > @backingInt(size)) {
+            try w.writeAll(": ");
+            try Value.printString(bytes, message.qt, p.comp, w, .bare);
+        }
     }
-    return allocating.written();
+    const written = allocating.written();
+    return .{
+        .full = written,
+        .req_start = @intCast(start),
+        .req_end = @intCast(end),
+    };
+}
+
+fn staticAssertEvaluationNote(p: *Parser, node: Node.Index, requirement: []const u8) Error!void {
+    const bin = loop: switch (node.get(&p.tree)) {
+        .cast => |cast_expr| continue :loop cast_expr.operand.get(&p.tree),
+        .paren_expr => |paren_expr| continue :loop paren_expr.operand.get(&p.tree),
+        .equal_expr,
+        .not_equal_expr,
+        .less_than_expr,
+        .less_than_equal_expr,
+        .greater_than_expr,
+        .greater_than_equal_expr,
+        => |bin| bin,
+        else => return,
+    };
+    var note_bfa_buf: [1024]u8 = undefined;
+    var note_bfa: std.heap.BufferFirstAllocator = .init(&note_bfa_buf, p.comp.gpa);
+    var note_allocating: std.Io.Writer.Allocating = .init(note_bfa.allocator());
+    defer note_allocating.deinit();
+
+    const lhs_val = p.tree.value_map.get(bin.lhs) orelse return;
+    const rhs_val = p.tree.value_map.get(bin.rhs) orelse return;
+
+    const w = &note_allocating.writer;
+    if (lhs_val.print(bin.lhs.qt(&p.tree), p.comp, w) catch return) |_| return;
+    w.print(" {s} ", .{p.tokSlice(bin.op_tok)}) catch return;
+    if (rhs_val.print(bin.rhs.qt(&p.tree), p.comp, w) catch return) |_| return;
+
+    const eval_text = note_allocating.written();
+
+    if (std.mem.eql(u8, eval_text, requirement)) return;
+
+    try p.err(bin.op_tok, .static_assert_expression_evaluates_to, .{eval_text});
 }
 
 /// staticAssert
@@ -1766,8 +1803,11 @@ fn staticAssert(p: *Parser) Error!bool {
     const static_assert = p.eatToken(.keyword_static_assert) orelse p.eatToken(.keyword_c23_static_assert) orelse return false;
     const l_paren = try p.expectToken(.l_paren);
     const res_token = p.tok_i;
+    const old_record_static_assert_eval_note = p.record_static_assert_eval_note;
+    p.record_static_assert_eval_note = true;
+    defer p.record_static_assert_eval_note = old_record_static_assert_eval_note;
+
     var res = try p.constExpr(.gnu_folding_extension);
-    const res_node = res.node;
     const str = if (p.eatToken(.comma) != null)
         switch (p.tok_ids[p.tok_i]) {
             .string_literal,
@@ -1807,11 +1847,9 @@ fn staticAssert(p: *Parser) Error!bool {
             var allocating: std.Io.Writer.Allocating = .init(bfa.allocator());
             defer allocating.deinit();
 
-            if (p.staticAssertMessage(res_node, str, &allocating) catch return error.OutOfMemory) |message| {
-                try p.err(static_assert, .static_assert_failure_message, .{message});
-            } else {
-                try p.err(static_assert, .static_assert_failure, .{});
-            }
+            const message = p.staticAssertMessage(res.node, str, &allocating) catch return error.OutOfMemory;
+            try p.err(res_token, .static_assert_failure_message, .{message.full});
+            try p.staticAssertEvaluationNote(res.node, message.full[message.req_start..message.req_end]);
         }
     }
 
@@ -2659,8 +2697,7 @@ fn getAnonymousName(p: *Parser, kind_tok: TokenIndex) !StringId {
 
     var arena = p.comp.type_store.anon_name_arena.promote(p.comp.gpa);
     defer p.comp.type_store.anon_name_arena = arena.state;
-    const str = try std.fmt.allocPrint(
-        arena.allocator(),
+    const str = try arena.allocator().print(
         "(anonymous {s} at {s}:{d}:{d})",
         .{ kind_str, source.path, line_col.line_no, line_col.col },
     );
@@ -2682,7 +2719,7 @@ fn recordSpec(p: *Parser) Error!QualType {
     try p.attributeSpecifier();
 
     const reserved_index = try p.tree.nodes.addOne(gpa);
-    const record_decl: Tree.Node.Index = @enumFromInt(reserved_index);
+    const record_decl: Tree.Node.Index = @fromBackingInt(@intCast(reserved_index));
 
     const maybe_ident = try p.eatIdentifier();
     try p.attributeSpecifier();
@@ -2856,9 +2893,9 @@ fn recordSpec(p: *Parser) Error!QualType {
     }
 
     if (is_struct) {
-        try p.comp.type_store.set(gpa, .{ .@"struct" = record_ty }, @intFromEnum(qt._index));
+        try p.comp.type_store.set(gpa, .{ .@"struct" = record_ty }, @backingInt(qt._index));
     } else {
-        try p.comp.type_store.set(gpa, .{ .@"union" = record_ty }, @intFromEnum(qt._index));
+        try p.comp.type_store.set(gpa, .{ .@"union" = record_ty }, @backingInt(qt._index));
     }
     return qt;
 }
@@ -3041,7 +3078,7 @@ fn recordDecl(p: *Parser) Error!bool {
                 .name = interned_name,
                 .qt = qt,
                 .name_tok = name_tok,
-                .bit_width = if (bits) |some| @enumFromInt(some) else .null,
+                .bit_width = if (bits) |some| @fromBackingInt(some) else .null,
                 .field_decl = .pack(node),
             });
             if (name_tok != 0) try p.record.addField(p, interned_name, name_tok);
@@ -3226,7 +3263,7 @@ fn enumSpec(p: *Parser) Error!QualType {
     } else null;
 
     const reserved_index = try p.tree.nodes.addOne(gpa);
-    const enum_decl: Tree.Node.Index = @enumFromInt(reserved_index);
+    const enum_decl: Tree.Node.Index = @fromBackingInt(@intCast(reserved_index));
 
     const l_brace = p.eatToken(.l_brace) orelse {
         const ident = maybe_ident orelse {
@@ -3386,7 +3423,7 @@ fn enumSpec(p: *Parser) Error!QualType {
                 new_field_node.enum_field.init = res.node;
             }
 
-            try p.tree.setNode(new_field_node, @intFromEnum(field_node));
+            try p.tree.setNode(new_field_node, @backingInt(field_node));
         }
     }
 
@@ -3396,7 +3433,7 @@ fn enumSpec(p: *Parser) Error!QualType {
         enum_ty.decl_node = enum_decl;
         const base_type = qt.base(p.comp);
         std.debug.assert(base_type.type.@"enum".name == enum_ty.name);
-        try p.comp.type_store.set(gpa, .{ .@"enum" = enum_ty }, @intFromEnum(base_type.qt._index));
+        try p.comp.type_store.set(gpa, .{ .@"enum" = enum_ty }, @backingInt(base_type.qt._index));
     }
 
     // declare a symbol for the type
@@ -3850,33 +3887,38 @@ fn declarator(
 ) Error!?Declarator {
     var d = Declarator{ .name = 0, .qt = base_qt };
 
-    if (p.eatToken(.caret)) |caret| {
-        d.qt = try p.wip_attrs.applyTypeAttrs(p, d.qt);
-        if (!p.comp.langopts.blocks) try p.err(caret, .blocks_not_enabled, .{});
-        try p.err(caret, .blocks_are_clang_extension, .{});
-
-        d.declarator_type = .block;
-        var builder: TypeStore.Builder = .{ .parser = p };
-        _ = try p.typeQual(&builder, true);
-
-        const block_qt = try p.comp.type_store.put(p.comp.gpa, .{ .block = .{
-            .func = d.qt,
-        } });
-        d.qt = try builder.finishQuals(block_qt);
-    }
-
     // Parse potential pointer declarators first.
-    while (p.eatToken(.asterisk)) |_| {
-        d.qt = try p.wip_attrs.applyTypeAttrs(p, d.qt);
-        d.declarator_type = .pointer;
-        var builder: TypeStore.Builder = .{ .parser = p };
-        _ = try p.typeQual(&builder, true);
+    while (true) switch (p.tok_ids[p.tok_i]) {
+        .caret => {
+            const caret = p.tok_i;
+            p.tok_i += 1;
+            d.qt = try p.wip_attrs.applyTypeAttrs(p, d.qt);
+            if (!p.comp.langopts.blocks) try p.err(caret, .blocks_not_enabled, .{});
+            try p.err(caret, .blocks_are_clang_extension, .{});
 
-        const pointer_qt = try p.comp.type_store.put(p.comp.gpa, .{ .pointer = .{
-            .child = d.qt,
-        } });
-        d.qt = try builder.finishQuals(pointer_qt);
-    }
+            d.declarator_type = .block;
+            var builder: TypeStore.Builder = .{ .parser = p };
+            _ = try p.typeQual(&builder, true);
+
+            const block_qt = try p.comp.type_store.put(p.comp.gpa, .{ .block = .{
+                .func = d.qt,
+            } });
+            d.qt = try builder.finishQuals(block_qt);
+        },
+        .asterisk => {
+            p.tok_i += 1;
+            d.qt = try p.wip_attrs.applyTypeAttrs(p, d.qt);
+            d.declarator_type = .pointer;
+            var builder: TypeStore.Builder = .{ .parser = p };
+            _ = try p.typeQual(&builder, true);
+
+            const pointer_qt = try p.comp.type_store.put(p.comp.gpa, .{ .pointer = .{
+                .child = d.qt,
+            } });
+            d.qt = try builder.finishQuals(pointer_qt);
+        },
+        else => break,
+    };
 
     const maybe_ident = p.tok_i;
     if (kind != .abstract and (try p.eatIdentifier()) != null) {
@@ -3937,7 +3979,7 @@ fn declarator(
                     else => unreachable,
                 }
                 // Child type is always stored in repr.data[0]
-                p.comp.type_store.types.items(.data)[@intFromEnum(cur._index)][0] = @bitCast(outer);
+                p.comp.type_store.types.items(.data)[@backingInt(cur._index)][0] = @bitCast(outer);
                 break;
             }
         }
@@ -5746,7 +5788,7 @@ fn labeledStmt(p: *Parser) Error!?Node.Index {
         }
 
         node.labeled_stmt.body = try p.labelableStmt();
-        try p.tree.setNode(node, @intFromEnum(labeled_stmt));
+        try p.tree.setNode(node, @backingInt(labeled_stmt));
 
         if (applied_any and node.labeled_stmt.body.get(&p.tree) == .decl_stmt) {
             try p.err(attr_tok, .gnu_label_attr, .{});
@@ -5956,7 +5998,7 @@ fn pointerValue(p: *Parser, node: Node.Index, offset: Value) !Value {
         .decl_ref_expr => |decl_ref| {
             const var_name = try p.comp.internString(p.tokSlice(decl_ref.name_tok));
             const sym = p.syms.findSymbol(var_name) orelse return .{};
-            return Value.pointer(.{ .node = @intFromEnum(sym.node), .offset = offset.ref() }, p.comp);
+            return Value.pointer(.{ .node = @backingInt(sym.node), .offset = offset.ref() }, p.comp);
         },
         .string_literal_expr => return p.tree.value_map.get(node).?,
         else => return .{},
@@ -6117,17 +6159,17 @@ fn returnStmt(p: *Parser) Error!?Node.Index {
 
 // ====== expressions ======
 
-pub fn macroExpr(p: *Parser, check_trailing: bool) Compilation.Error!bool {
+pub fn macroExpr(p: *Parser, check_trailing: bool) Compilation.Error!Value {
     const res = p.expect(condExpr) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.FatalError => return error.FatalError,
-        error.ParsingFailed => return false,
+        error.ParsingFailed => return .null,
     };
     if (check_trailing and p.tok_ids[p.tok_i] != .eof) {
         try p.err(p.tok_i, .invalid_preproc_operator, .{});
-        return false;
+        return .null;
     }
-    return res.val.toBool(p.comp);
+    return res.val;
 }
 
 const CallExpr = union(enum) {
@@ -8417,6 +8459,10 @@ fn eqExpr(p: *Parser) Error!?Result {
             else
                 lhs.val.compare(op, rhs.val, p.comp);
 
+            if (p.record_static_assert_eval_note and res == false) {
+                try lhs.putValue(p);
+                try rhs.putValue(p);
+            }
             lhs.val = if (res) |val| Value.fromBool(val) else .{};
         } else {
             lhs.val.boolCast(p.comp);
@@ -8450,6 +8496,10 @@ fn compExpr(p: *Parser) Error!?Result {
                 lhs.val.comparePointers(op, rhs.val, p.comp)
             else
                 lhs.val.compare(op, rhs.val, p.comp);
+            if (p.record_static_assert_eval_note and res == false) {
+                try lhs.putValue(p);
+                try rhs.putValue(p);
+            }
             lhs.val = if (res) |val| Value.fromBool(val) else .{};
         } else {
             lhs.val.boolCast(p.comp);
@@ -9707,6 +9757,8 @@ fn suffixExpr(p: *Parser, lhs: Result) Error!?Result {
                 try p.err(l_bracket, .invalid_subscript, .{});
             }
 
+            const item = try ptr.val.elem(index.val, p.comp);
+
             try ptr.saveValue(p);
             try index.saveValue(p);
             ptr.node = try p.addNode(.{ .array_access_expr = .{
@@ -9715,6 +9767,7 @@ fn suffixExpr(p: *Parser, lhs: Result) Error!?Result {
                 .index = index.node,
                 .qt = ptr.qt,
             } });
+            ptr.val = item;
             return ptr;
         },
         .period => {
@@ -10795,7 +10848,7 @@ fn stringLiteral(p: *Parser) Error!Result {
     const strings_top = p.strings.items.len;
     defer p.strings.items.len = strings_top;
 
-    const literal_start = mem.alignForward(usize, strings_top, @intFromEnum(char_width));
+    const literal_start = mem.alignForward(usize, strings_top, @backingInt(char_width));
     try p.strings.resize(gpa, literal_start);
 
     while (p.tok_i < string_end) : (p.tok_i += 1) {
@@ -10811,7 +10864,7 @@ fn stringLiteral(p: *Parser) Error!Result {
             .incorrect_encoding_is_error = count > 1,
         };
 
-        try p.strings.ensureUnusedCapacity(gpa, (slice.len + 1) * @intFromEnum(char_width)); // +1 for null terminator
+        try p.strings.ensureUnusedCapacity(gpa, (slice.len + 1) * @backingInt(char_width)); // +1 for null terminator
         while (try char_literal_parser.next()) |item| switch (item) {
             .value => |v| {
                 switch (char_width) {
@@ -10872,7 +10925,7 @@ fn stringLiteral(p: *Parser) Error!Result {
             },
         };
     }
-    p.strings.appendNTimesAssumeCapacity(0, @intFromEnum(char_width));
+    p.strings.appendNTimesAssumeCapacity(0, @backingInt(char_width));
     const slice = p.strings.items[literal_start..];
 
     // TODO this won't do anything if there is a cache hit
@@ -10887,7 +10940,7 @@ fn stringLiteral(p: *Parser) Error!Result {
 
     const array_qt = try p.comp.type_store.put(gpa, .{ .array = .{
         .elem = string_kind.elementType(p.comp),
-        .len = .{ .fixed = @divExact(slice.len, @intFromEnum(char_width)) },
+        .len = .{ .fixed = @divExact(slice.len, @backingInt(char_width)) },
     } });
     const res: Result = .{
         .qt = array_qt,
@@ -11245,7 +11298,7 @@ fn parseInt(p: *Parser, prefix: NumberPrefix, buf: []const u8, suffix: NumberSuf
     if (prefix == .binary) {
         try p.err(tok_i, .binary_integer_literal, .{});
     }
-    const base = @intFromEnum(prefix);
+    const base = @backingInt(prefix);
     var res = if (suffix.isBitInt())
         try p.bitInt(base, buf, suffix, tok_i)
     else
@@ -11343,7 +11396,7 @@ fn getExponent(p: *Parser, buf: []const u8, prefix: NumberPrefix, tok_i: TokenIn
         }
     } else buf.len;
     const exponent = buf[0..end];
-    if (std.mem.indexOfAny(u8, exponent, "0123456789") == null) {
+    if (std.mem.findAny(u8, exponent, "0123456789") == null) {
         try p.err(tok_i, .exponent_has_no_digits, .{});
         return error.ParsingFailed;
     }

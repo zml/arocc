@@ -129,7 +129,7 @@ pub fn declareSymbol(
     };
     const name = if (maybe_name) |some| some else blk: {
         defer elf.unnamed_symbol_mangle += 1;
-        break :blk try std.fmt.allocPrint(elf.arena.allocator(), ".L.{d}", .{elf.unnamed_symbol_mangle});
+        break :blk try elf.arena.allocator().print(".L.{d}", .{elf.unnamed_symbol_mangle});
     };
 
     const gop = if (linkage == .Internal)
@@ -209,7 +209,7 @@ pub fn finish(elf: *Elf, w: *std.Io.Writer) !void {
         .entry = 0, // linker will handle this
         .phoff = 0, // no program header
         .shoff = sh_offset_aligned, // section headers offset
-        .flags = 0, // no flags
+        .flags = .{ .int = 0 }, // no flags
         .ehsize = @sizeOf(std.elf.Elf64.Ehdr),
         .phentsize = 0, // no program header
         .phnum = 0, // no program header
@@ -350,7 +350,7 @@ pub fn finish(elf: *Elf, w: *std.Io.Writer) !void {
             const rela_name_offset: u32 = if (rela_count != 0) @truncate(".rela".len) else 0;
             try w.writeStruct(std.elf.Elf64.Shdr{
                 .name = rela_name_offset + name_offset,
-                .type = @enumFromInt(sect.type),
+                .type = @fromBackingInt(sect.type),
                 .flags = @bitCast(sect.flags),
                 .addr = 0,
                 .offset = sect_offset,

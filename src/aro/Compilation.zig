@@ -406,9 +406,9 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
             const version = target.os.version_range.semver.min;
             var version_buf: [8]u8 = undefined;
             const version_str = if (target.os.tag == .macos and version.order(.{ .major = 10, .minor = 10, .patch = 0 }) == .lt)
-                std.fmt.bufPrint(&version_buf, "{d}{d}{d}", .{ version.major, @min(version.minor, 9), @min(version.patch, 9) }) catch unreachable
+                mem.print(&version_buf, "{d}{d}{d}", .{ version.major, @min(version.minor, 9), @min(version.patch, 9) }) catch unreachable
             else
-                std.fmt.bufPrint(&version_buf, "{d:0>2}{d:0>2}{d:0>2}", .{ version.major, @min(version.minor, 99), @min(version.patch, 99) }) catch unreachable;
+                mem.print(&version_buf, "{d:0>2}{d:0>2}{d:0>2}", .{ version.major, @min(version.minor, 99), @min(version.patch, 99) }) catch unreachable;
 
             try w.print("#define {s} {s}\n", .{ switch (target.os.tag) {
                 .tvos => "__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__",
@@ -623,7 +623,7 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
 
                 .{ .mmx, "__MMX__" },
             }) |fs| {
-                if (features.isEnabled(@intFromEnum(fs[0]))) {
+                if (features.isEnabled(@backingInt(fs[0]))) {
                     try define(w, fs[1]);
                 }
             }
@@ -958,7 +958,7 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
                 .{ .d128, "SYSREG128" },
                 .{ .gcs, "GCS" },
             }) |fs| {
-                if (features.isEnabled(@intFromEnum(fs[0]))) {
+                if (features.isEnabled(@backingInt(fs[0]))) {
                     try w.print("#define __ARM_FEATURE_{s} 1\n", .{fs[1]});
                 }
             }
@@ -1186,7 +1186,7 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
     // TODO: clang treats __FLT_EVAL_METHOD__ as a special-cased macro because evaluating it within a scope
     // where `#pragma clang fp eval_method(X)` has been called produces an error diagnostic.
     const flt_eval_method = comp.langopts.fp_eval_method orelse target.defaultFpEvalMethod();
-    try w.print("#define __FLT_EVAL_METHOD__ {d}\n", .{@intFromEnum(flt_eval_method)});
+    try w.print("#define __FLT_EVAL_METHOD__ {d}\n", .{@backingInt(flt_eval_method)});
 
     try w.writeAll(
         \\#define __FLT_RADIX__ 2
@@ -1201,13 +1201,13 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
                 \\#define __pic__ {0d}
                 \\#define __PIC__ {0d}
                 \\
-            , .{@intFromEnum(comp.code_gen_options.pic_level)});
+            , .{@backingInt(comp.code_gen_options.pic_level)});
             if (comp.code_gen_options.is_pie) {
                 try w.print(
                     \\#define __pie__ {0d}
                     \\#define __PIE__ {0d}
                     \\
-                , .{@intFromEnum(comp.code_gen_options.pic_level)});
+                , .{@backingInt(comp.code_gen_options.pic_level)});
             }
         },
     }
@@ -1241,7 +1241,7 @@ pub fn generateBuiltinMacros(comp: *Compilation, system_defines_mode: SystemDefi
 
     if (allocating.written().len > std.math.maxInt(u32)) return error.FileTooBig;
 
-    const contents = try allocating.toOwnedSlice();
+    const contents = try allocating.toOwnedSliceSentinel(0);
     errdefer comp.gpa.free(contents);
     return comp.addSourceFromOwnedBuffer("<builtin>", contents, .user);
 }
@@ -1426,7 +1426,7 @@ fn generateFastOrLeastType(
         .least => "LEAST",
     };
 
-    const full = std.fmt.bufPrint(&buf, "{s}{s}{d}{s}", .{
+    const full = mem.print(&buf, "{s}{s}{d}{s}", .{
         base_name, kind_str, bits, suffix,
     }) catch unreachable;
 
@@ -1540,7 +1540,7 @@ fn generateExactWidthType(comp: *Compilation, w: *Io.Writer, original_qt: QualTy
 
     var buffer: [16]u8 = undefined;
     const suffix = "_TYPE__";
-    const full = std.fmt.bufPrint(&buffer, "{s}{d}{s}", .{
+    const full = mem.print(&buffer, "{s}{d}{s}", .{
         if (unsigned) "__UINT" else "__INT", width, suffix,
     }) catch unreachable;
 
@@ -1594,7 +1594,7 @@ fn generateExactWidthIntMax(comp: *Compilation, w: *Io.Writer, original_qt: Qual
     }
 
     var name_buffer: [6]u8 = undefined;
-    const name = std.fmt.bufPrint(&name_buffer, "{s}{d}", .{
+    const name = mem.print(&name_buffer, "{s}{d}", .{
         if (unsigned) "UINT" else "INT", bit_count,
     }) catch unreachable;
 
@@ -1657,16 +1657,16 @@ pub fn hasClangStyleBoundsSafety(comp: *const Compilation) bool {
 
 pub fn getSource(comp: *const Compilation, id: Source.Id) Source {
     if (id.alias) {
-        return comp.source_aliases.items[@intFromEnum(id.index)];
+        return comp.source_aliases.items[@backingInt(id.index)];
     }
     if (id.index == .generated) return .{
         .path = "<scratch space>",
-        .buf = comp.generated_buf.items,
+        .buf = @ptrCast(comp.generated_buf.items),
         .id = .generated,
         .splice_locs = &.{},
         .kind = .user,
     };
-    return comp.sources.values()[@intFromEnum(id.index)];
+    return comp.sources.values()[@backingInt(id.index)];
 }
 
 /// Creates a Source from `buf` and adds it to the Compilation
@@ -1675,7 +1675,7 @@ pub fn getSource(comp: *const Compilation, id: Source.Id) Source {
 /// or line-ending changes happen.
 /// caller retains ownership of `path`
 /// To add a file's contents given its path, see addSourceFromPath
-pub fn addSourceFromOwnedBuffer(comp: *Compilation, path: []const u8, buf: []u8, kind: Source.Kind) !Source {
+pub fn addSourceFromOwnedBuffer(comp: *Compilation, path: []const u8, buf: [:0]u8, kind: Source.Kind) !Source {
     assert(buf.len <= std.math.maxInt(u32));
     try comp.sources.ensureUnusedCapacity(comp.gpa, 1);
 
@@ -1686,7 +1686,7 @@ pub fn addSourceFromOwnedBuffer(comp: *Compilation, path: []const u8, buf: []u8,
     var splice_list: std.ArrayList(u32) = .empty;
     defer splice_list.deinit(comp.gpa);
 
-    const source_id: Source.Id = .{ .index = @enumFromInt(comp.sources.count()) };
+    const source_id: Source.Id = .{ .index = @fromBackingInt(@intCast(comp.sources.count())) };
 
     var i: u32 = 0;
     var backslash_loc: u32 = undefined;
@@ -1798,9 +1798,9 @@ pub fn addSourceFromOwnedBuffer(comp: *Compilation, path: []const u8, buf: []u8,
     if (i != contents.len) {
         var list: std.ArrayList(u8) = .{
             .items = contents[0..i],
-            .capacity = contents.len,
+            .capacity = contents.len + 1, // +1 for sentinel
         };
-        contents = try list.toOwnedSlice(comp.gpa);
+        contents = try list.toOwnedSliceSentinel(comp.gpa, 0);
     }
     errdefer @compileError("errdefers in callers would possibly free the realloced slice using the original len");
 
@@ -1819,7 +1819,7 @@ pub fn addSourceFromOwnedBuffer(comp: *Compilation, path: []const u8, buf: []u8,
 fn addNewlineEscapeError(
     comp: *Compilation,
     path: []const u8,
-    buf: []const u8,
+    buf: [:0]const u8,
     splice_locs: []const u32,
     byte_offset: u32,
     line: u32,
@@ -1855,7 +1855,7 @@ pub fn addSourceFromBuffer(comp: *Compilation, path: []const u8, buf: []const u8
     if (comp.sources.get(path)) |some| return some;
     if (buf.len > std.math.maxInt(u32)) return error.FileTooBig;
 
-    const contents = try comp.gpa.dupe(u8, buf);
+    const contents = try comp.gpa.dupeSentinel(u8, buf, 0);
     errdefer comp.gpa.free(contents);
 
     return comp.addSourceFromOwnedBuffer(path, contents, .user);
@@ -1870,7 +1870,7 @@ pub fn addSourceFromPath(comp: *Compilation, path: []const u8) !Source {
 fn addSourceFromPathExtra(comp: *Compilation, path: []const u8, kind: Source.Kind) !Source {
     if (comp.sources.get(path)) |some| return some;
 
-    if (mem.indexOfScalar(u8, path, 0) != null) {
+    if (mem.findScalar(u8, path, 0) != null) {
         return error.FileNotFound;
     }
 
@@ -1888,7 +1888,7 @@ pub fn addSourceFromFile(comp: *Compilation, file: std.Io.File, path: []const u8
 pub fn addSourceAlias(comp: *Compilation, source: Source.Id, new_path: []const u8, new_kind: Source.Kind) !Source.Id {
     var aliased_source = comp.getSource(source);
     aliased_source.path = new_path;
-    aliased_source.id = .{ .index = @enumFromInt(comp.source_aliases.items.len), .alias = true };
+    aliased_source.id = .{ .index = @fromBackingInt(@intCast(comp.source_aliases.items.len)), .alias = true };
     aliased_source.kind = new_kind;
     try comp.source_aliases.append(comp.gpa, aliased_source);
     return aliased_source.id;
@@ -2145,7 +2145,7 @@ const FindInclude = struct {
         var bfa_buf: [path_buf_stack_limit]u8 = undefined;
         var bfa_state: std.heap.BufferFirstAllocator = .init(&bfa_buf, find.comp.gpa);
         const bfa = bfa_state.allocator();
-        const framework_lookup = try std.fmt.allocPrint(bfa, "{s}.framework", .{framework_name});
+        const framework_lookup = try bfa.print("{s}.framework", .{framework_name});
         defer bfa.free(framework_lookup);
 
         const res = try find.check(&.{
@@ -2156,7 +2156,7 @@ const FindInclude = struct {
         }, kind, false) orelse return null;
 
         // Mark the new source as an umbrella framework for subframework search within it.
-        const new_source = &find.comp.sources.values()[@intFromEnum(res.source.index)];
+        const new_source = &find.comp.sources.values()[@backingInt(res.source.index)];
         const framework_name_index = mem.find(u8, new_source.path, framework_lookup) orelse return res;
         new_source.umbrella_framework_path = new_source.path[0 .. framework_name_index + framework_lookup.len];
         return res;
@@ -2169,7 +2169,7 @@ const FindInclude = struct {
         var bfa_buf: [path_buf_stack_limit]u8 = undefined;
         var bfa_state: std.heap.BufferFirstAllocator = .init(&bfa_buf, find.comp.gpa);
         const bfa = bfa_state.allocator();
-        const framework_lookup = try std.fmt.allocPrint(bfa, "{s}.framework", .{framework_name});
+        const framework_lookup = try bfa.print("{s}.framework", .{framework_name});
         defer bfa.free(framework_lookup);
 
         const res = try find.check(&.{
@@ -2184,7 +2184,7 @@ const FindInclude = struct {
         // subframeworks (i.e. they can't be umbrella frameworks), but they
         // can reference one another, meaning that we keep the same
         // umbrella framework.
-        const new_source = &find.comp.sources.values()[@intFromEnum(res.source.index)];
+        const new_source = &find.comp.sources.values()[@backingInt(res.source.index)];
         new_source.umbrella_framework_path = new_source.path[0..umbrella_framework_path.len];
         return res;
     }
@@ -2205,7 +2205,7 @@ const FindInclude = struct {
         find.comp.normalizePath(header_path);
 
         if (find.wait_for) |wait_for| if (std.fs.path.dirname(header_path)) |header_dir| {
-            if (std.mem.eql(u8, header_dir, wait_for)) find.wait_for = null;
+            if (mem.eql(u8, header_dir, wait_for)) find.wait_for = null;
             return null;
         };
 
@@ -2234,8 +2234,8 @@ pub const IncludeType = enum {
     cli,
 };
 
-fn getPathContents(comp: *Compilation, path: []const u8, limit: Io.Limit) ![]u8 {
-    if (mem.indexOfScalar(u8, path, 0) != null) {
+fn getPathContents(comp: *Compilation, path: []const u8, limit: Io.Limit) ![:0]u8 {
+    if (mem.findScalar(u8, path, 0) != null) {
         return error.FileNotFound;
     }
 
@@ -2244,7 +2244,7 @@ fn getPathContents(comp: *Compilation, path: []const u8, limit: Io.Limit) ![]u8 
     return comp.getFileContents(file, limit);
 }
 
-fn getFileContents(comp: *Compilation, file: std.Io.File, limit: Io.Limit) ![]u8 {
+fn getFileContents(comp: *Compilation, file: std.Io.File, limit: Io.Limit) ![:0]u8 {
     var file_buf: [4096]u8 = undefined;
     var file_reader = file.reader(comp.io, &file_buf);
 
@@ -2259,19 +2259,19 @@ fn getFileContents(comp: *Compilation, file: std.Io.File, limit: Io.Limit) ![]u8
     var remaining = limit.min(.limited(std.math.maxInt(u32)));
     while (remaining.nonzero()) {
         const n = file_reader.interface.stream(&allocating.writer, remaining) catch |err| switch (err) {
-            error.EndOfStream => return allocating.toOwnedSlice(),
+            error.EndOfStream => return allocating.toOwnedSliceSentinel(0),
             error.WriteFailed => return error.OutOfMemory,
             error.ReadFailed => return file_reader.err.?,
         };
         remaining = remaining.subtract(n).?;
     }
     if (limit == .unlimited) return error.FileTooBig;
-    return allocating.toOwnedSlice();
+    return allocating.toOwnedSliceSentinel(0);
 }
 
 fn normalizePath(comp: *Compilation, path: []u8) void {
     if (comp.langopts.ms_extensions and @import("builtin").target.os.tag != .windows) {
-        std.mem.replaceScalar(u8, path, std.fs.path.sep_windows, std.fs.path.sep_posix);
+        mem.replaceScalar(u8, path, std.fs.path.sep_windows, std.fs.path.sep_posix);
     }
 }
 
@@ -2283,7 +2283,7 @@ pub fn findEmbed(
     include_type: IncludeType,
     limit: Io.Limit,
     opt_dep_file: ?*DepFile,
-) !?[]u8 {
+) !?[:0]u8 {
     if (std.fs.path.isAbsolute(filename)) {
         if (comp.getPathContents(filename, limit)) |some| {
             errdefer comp.gpa.free(some);
@@ -2535,7 +2535,7 @@ test "addSourceFromBuffer" {
             try std.testing.expectEqualSlices(u32, splices, source.splice_locs);
         }
 
-        fn withAllocationFailures(allocator: std.mem.Allocator) !void {
+        fn withAllocationFailures(allocator: mem.Allocator) !void {
             var comp = try Compilation.init(.testing);
             comp.gpa = allocator;
             defer comp.deinit();
@@ -2592,15 +2592,15 @@ test "addSourceFromBuffer - exhaustive check for carriage return elimination" {
     while (true) {
         const source = try comp.addSourceFromBuffer(&buf, &buf);
         source_count += 1;
-        try std.testing.expect(std.mem.indexOfScalar(u8, source.buf, '\r') == null);
+        try std.testing.expect(mem.findScalar(u8, source.buf, '\r') == null);
 
-        if (std.mem.allEqual(u8, &buf, alphabet[alen - 1])) break;
+        if (mem.allEqual(u8, &buf, alphabet[alen - 1])) break;
 
-        var idx = std.mem.indexOfScalar(u8, &alphabet, buf[buf.len - 1]).?;
+        var idx = mem.findScalar(u8, &alphabet, buf[buf.len - 1]).?;
         buf[buf.len - 1] = alphabet[(idx + 1) % alen];
         var j = buf.len - 1;
         while (j > 0) : (j -= 1) {
-            idx = std.mem.indexOfScalar(u8, &alphabet, buf[j - 1]).?;
+            idx = mem.findScalar(u8, &alphabet, buf[j - 1]).?;
             if (buf[j] == alphabet[0]) buf[j - 1] = alphabet[(idx + 1) % alen] else break;
         }
     }

@@ -118,7 +118,7 @@ fn emitSingleValue(c: *AsmCodeGen, qt: QualType, node: Node.Index) !void {
         const bytes = value.toBytes(c.comp);
         const directive = if (bytes.len > bit_size / 8) "ascii" else "string";
         try c.data.print("  .{s} ", .{directive});
-        try Value.printString(bytes, qt, c.comp, c.data);
+        try Value.printString(bytes, qt, c.comp, c.data, .quoted);
 
         try c.data.writeByte('\n');
     } else unreachable;
@@ -167,7 +167,7 @@ fn genDecls(c: *AsmCodeGen) !void {
     if (c.tree.comp.code_gen_options.debug != .strip) {
         const sources = c.tree.comp.sources.values();
         for (sources) |source| {
-            try c.data.print("  .file {d} \"{s}\"\n", .{ @intFromEnum(source.id.index) + 1, source.path });
+            try c.data.print("  .file {d} \"{s}\"\n", .{ @backingInt(source.id.index) + 1, source.path });
         }
     }
 

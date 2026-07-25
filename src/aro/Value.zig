@@ -21,7 +21,7 @@ pub const @"null" = Value{ .opt_ref = .null };
 
 pub fn intern(comp: *Compilation, k: Interner.Key) !Value {
     const r = try comp.interner.put(comp.gpa, k);
-    return .{ .opt_ref = @enumFromInt(@intFromEnum(r)) };
+    return .{ .opt_ref = @fromBackingInt(@backingInt(r)) };
 }
 
 pub fn int(i: anytype, comp: *Compilation) !Value {
@@ -39,11 +39,11 @@ pub fn pointer(r: Interner.Key.Pointer, comp: *Compilation) !Value {
 
 pub fn ref(v: Value) Interner.Ref {
     std.debug.assert(v.opt_ref != .none);
-    return @enumFromInt(@intFromEnum(v.opt_ref));
+    return @fromBackingInt(@backingInt(v.opt_ref));
 }
 
 pub fn fromRef(r: Interner.Ref) Value {
-    return .{ .opt_ref = @enumFromInt(@intFromEnum(r)) };
+    return .{ .opt_ref = @fromBackingInt(@backingInt(r)) };
 }
 
 pub fn is(v: Value, tag: std.meta.Tag(Interner.Key), comp: *const Compilation) bool {
@@ -1067,6 +1067,18 @@ pub fn maxInt(qt: QualType, comp: *Compilation) !Value {
     return twosCompIntLimit(.max, qt, comp);
 }
 
+pub fn elem(arr: Value, index: Value, comp: *Compilation) !Value {
+    const index_int = index.toInt(u32, comp) orelse return .{};
+    if (arr.opt_ref == .none) return .{};
+    switch (comp.interner.get(arr.ref())) {
+        .bytes => |b| {
+            if (index_int > b.len) return .{};
+            return Value.int(b[index_int], comp);
+        },
+        else => return .{},
+    }
+}
+
 const NestedPrint = union(enum) {
     pointer: struct {
         node: u32,
@@ -1099,7 +1111,7 @@ pub fn print(v: Value, qt: QualType, comp: *const Compilation, w: *std.Io.Writer
             .f32 => |x| try w.print("{d}", .{@round(@as(f64, @floatCast(x)) * 1000000) / 1000000}),
             inline else => |x| try w.print("{d}", .{@as(f64, @floatCast(x))}),
         },
-        .bytes => |b| try printString(b, qt, comp, w),
+        .bytes => |b| try printString(b, qt, comp, w, .quoted),
         .complex => |repr| switch (repr) {
             .cf32 => |components| try w.print("{d} + {d}i", .{ @round(@as(f64, @floatCast(components[0])) * 1000000) / 1000000, @round(@as(f64, @floatCast(components[1])) * 1000000) / 1000000 }),
             inline else => |components| try w.print("{d} + {d}i", .{ @as(f64, @floatCast(components[0])), @as(f64, @floatCast(components[1])) }),
@@ -1110,10 +1122,13 @@ pub fn print(v: Value, qt: QualType, comp: *const Compilation, w: *std.Io.Writer
     return null;
 }
 
-pub fn printString(bytes: []const u8, qt: QualType, comp: *const Compilation, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    const size: Compilation.CharUnitSize = @enumFromInt(qt.childType(comp).sizeof(comp));
-    const without_null = bytes[0 .. bytes.len - @intFromEnum(size)];
-    try w.writeByte('"');
+pub fn printString(bytes: []const u8, qt: QualType, comp: *const Compilation, w: *std.Io.Writer, style: enum { quoted, bare }) std.Io.Writer.Error!void {
+    if (style == .quoted) {
+        try w.writeByte('"');
+    }
+
+    const size: Compilation.CharUnitSize = @fromBackingInt(@intCast(qt.childType(comp).sizeof(comp)));
+    const without_null = bytes[0 .. bytes.len - @backingInt(size)];
     switch (size) {
         .@"1" => try std.zig.stringEscape(without_null, w),
         .@"2" => {
@@ -1152,5 +1167,8 @@ pub fn printString(bytes: []const u8, qt: QualType, comp: *const Compilation, w:
             }
         },
     }
-    try w.writeByte('"');
+
+    if (style == .quoted) {
+        try w.writeByte('"');
+    }
 }
