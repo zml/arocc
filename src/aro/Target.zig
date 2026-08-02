@@ -242,7 +242,12 @@ pub fn intMaxType(target: *const Target) QualType {
         .aarch64,
         .aarch64_be,
         .sparc64,
-        => if (target.os.tag != .openbsd) return .long,
+        => {
+            if (target.os.tag == .openbsd) return .long_long;
+            if (target.os.tag == .windows) return .long_long;
+            if (target.os.tag.isDarwin() and target.abi == .ilp32) return .long_long;
+            return .long;
+        },
 
         .bpfel,
         .bpfeb,
@@ -256,10 +261,19 @@ pub fn intMaxType(target: *const Target) QualType {
         .x86_64 => switch (target.os.tag) {
             .windows, .openbsd, .uefi => {},
             else => switch (target.abi) {
-                .gnux32, .muslx32 => {},
+                .gnux32,
+                .muslx32,
+                .x32,
+                .gnuabin32,
+                .muslabin32,
+                .abin32,
+                .ilp32,
+                => {},
                 else => return .long,
             },
         },
+
+        .mips, .mipsel, .sparc => {}, // TODO
 
         else => {},
     }
@@ -1629,15 +1643,15 @@ pub fn ptrBitWidth(target: *const Target) u16 {
 }
 
 pub fn cCharSignedness(target: *const Target) std.builtin.Signedness {
-    return target.toZigTarget().cCharSignedness();
+    return target.toZigTarget().cCharSignedness().?;
 }
 
 pub fn cTypeBitSize(target: *const Target, c_type: std.Target.CType) u16 {
-    return target.toZigTarget().cTypeBitSize(c_type);
+    return target.toZigTarget().cTypeBitSize(c_type).?;
 }
 
 pub fn cTypeAlignment(target: *const Target, c_type: std.Target.CType) u16 {
-    return target.toZigTarget().cTypeAlignment(c_type);
+    return target.toZigTarget().cTypeAlignment(c_type).?;
 }
 
 pub fn standardDynamicLinkerPath(target: *const Target) std.Target.DynamicLinker {

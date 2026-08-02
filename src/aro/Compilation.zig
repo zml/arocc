@@ -25,7 +25,7 @@ const Type = TypeStore.Type;
 const QualType = TypeStore.QualType;
 
 pub const Error = error{
-    /// A fatal error has ocurred and compilation has stopped.
+    /// A fatal error has occurred and compilation has stopped.
     FatalError,
 } || Allocator.Error;
 pub const AddSourceError = Error || error{FileTooBig};
@@ -182,6 +182,16 @@ pub const InitOptions = struct {
         .arena = undefined,
         .io = std.testing.io,
         .diagnostics = undefined,
+        .environ_map = null,
+        .add_default_pragma_handlers = false,
+    };
+
+    var fuzzing_diagnostics: Diagnostics = .{ .output = .ignore };
+    pub const fuzzing: InitOptions = .{
+        .gpa = std.testing.allocator,
+        .arena = undefined,
+        .io = std.Io.failing,
+        .diagnostics = &fuzzing_diagnostics,
         .environ_map = null,
         .add_default_pragma_handlers = false,
     };

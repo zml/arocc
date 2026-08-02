@@ -11,19 +11,17 @@ const char_info = @import("char_info.zig");
 const Compilation = @import("Compilation.zig");
 const Diagnostics = @import("Diagnostics.zig");
 const InitList = @import("InitList.zig");
-pub const Diagnostic = @import("Parser/Diagnostic.zig");
 const Preprocessor = @import("Preprocessor.zig");
 const record_layout = @import("record_layout.zig");
 const Source = @import("Source.zig");
 const StringId = @import("StringInterner.zig").StringId;
 const SymbolStack = @import("SymbolStack.zig");
 const Symbol = SymbolStack.Symbol;
-const text_literal = @import("text_literal.zig");
 const Tokenizer = @import("Tokenizer.zig");
+const number_literal = Tokenizer.number_literal;
+const text_literal = Tokenizer.text_literal;
 const Tree = @import("Tree.zig");
 const Token = Tree.Token;
-const NumberPrefix = Token.NumberPrefix;
-const NumberSuffix = Token.NumberSuffix;
 const TokenIndex = Tree.TokenIndex;
 const Node = Tree.Node;
 const TypeStore = @import("TypeStore.zig");
@@ -31,6 +29,8 @@ const Type = TypeStore.Type;
 const QualType = TypeStore.QualType;
 const Value = @import("Value.zig");
 const ArmLdrex = @import("LangOpts.zig").ArmLdrex;
+
+pub const Diagnostic = @import("Parser/Diagnostic.zig");
 
 const NodeList = std.ArrayList(Node.Index);
 const TentativeDefinitionKey = struct {
@@ -146,8 +146,6 @@ maybe_unused_decl: std.AutoArrayHashMapUnmanaged(Node.Index, bool) = .empty,
 local_unused_err_count: u32 = 0,
 
 // configuration and miscellaneous info
-no_eval: bool = false,
-in_macro: bool = false,
 extension_suppressed: bool = false,
 contains_address_of_label: bool = false,
 label_count: u32 = 0,
@@ -765,7 +763,6 @@ fn errDeprecated(p: *Parser, tok_i: TokenIndex, diagnostic: Diagnostic, msg: ?[]
 }
 
 fn addNode(p: *Parser, node: Tree.Node) Allocator.Error!Node.Index {
-    if (p.in_macro) return undefined;
     return p.tree.addNode(node);
 }
 
@@ -779,7 +776,6 @@ fn errExpectedToken(p: *Parser, expected: Token.Id, actual: Token.Id) Error {
 }
 
 fn addList(p: *Parser, nodes: []const Node.Index) Allocator.Error!Tree.Node.Range {
-    if (p.in_macro) return Tree.Node.Range{ .start = 0, .end = 0 };
     const start: u32 = @intCast(p.data.items.len);
     try p.data.appendSlice(nodes);
     const end: u32 = @intCast(p.data.items.len);
@@ -1956,7 +1952,7 @@ fn typeof(p: *Parser) Error!?QualType {
             .expr = null,
         } })).withQualifiers(qt);
     }
-    const typeof_expr = try p.parseNoEval(expr);
+    const typeof_expr = try p.expectResult(try p.binaryExpr(.any, false));
     try p.expectClosing(l_paren, .r_paren);
     if (typeof_expr.qt.isInvalid()) return null;
 
@@ -2666,8 +2662,9 @@ fn typeSpec(p: *Parser, builder: *TypeStore.Builder) Error!bool {
 
                 var bits: u64 = undefined;
                 if (res.val.opt_ref == .none) {
-                    try p.err(bit_int_tok, .expected_integer_constant_expr, .{});
-                    return error.ParsingFailed;
+                    if (builder.type == .none) try p.err(res.node.tok(&p.tree), .expected_integer_constant_expr, .{});
+                    try builder.combine(.{ .other = .invalid }, bit_int_tok);
+                    continue;
                 } else if (res.val.compare(.lte, .zero, p.comp)) {
                     bits = 0;
                 } else {
@@ -3838,6 +3835,14 @@ const Declarator = struct {
                     }
                     if (elem_qt.isQualified() and elem_qt.type(p.comp) != .typedef) {
                         try p.err(source_tok, .qualifier_non_outermost_array, .{});
+                    }
+                } else if (p.comp.langopts.emulate != .msvc) {
+                    if (elem_qt.sizeofOrNull(p.comp)) |elem_size| {
+                        const elem_align = elem_qt.alignof(p.comp);
+                        if (elem_size % elem_align != 0) {
+                            try p.err(source_tok, .array_elem_size_not_multiple, .{ elem_qt, elem_size, elem_align });
+                            return .nested_invalid;
+                        }
                     }
                 }
                 return .normal;
@@ -6159,19 +6164,6 @@ fn returnStmt(p: *Parser) Error!?Node.Index {
 
 // ====== expressions ======
 
-pub fn macroExpr(p: *Parser, check_trailing: bool) Compilation.Error!Value {
-    const res = p.expect(condExpr) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.FatalError => return error.FatalError,
-        error.ParsingFailed => return .null,
-    };
-    if (check_trailing and p.tok_ids[p.tok_i] != .eof) {
-        try p.err(p.tok_i, .invalid_preproc_operator, .{});
-        return .null;
-    }
-    return res.val;
-}
-
 const CallExpr = union(enum) {
     standard: Node.Index,
     builtin: struct {
@@ -6835,13 +6827,13 @@ pub const Result = struct {
         });
     }
 
-    fn adjustCondExprPtrs(a: *Result, tok: TokenIndex, b: *Result, p: *Parser) !bool {
+    fn adjustCondExprPtrs(a: *Result, tok: TokenIndex, b: *Result, p: *Parser) !void {
         assert(a.qt.isPointer(p.comp) and b.qt.isPointer(p.comp));
         const gpa = p.comp.gpa;
 
         const a_elem = a.qt.childType(p.comp);
         const b_elem = b.qt.childType(p.comp);
-        if (a_elem.eqlQualified(b_elem, p.comp)) return true;
+        if (a_elem.eqlQualified(b_elem, p.comp)) return;
 
         const has_void_pointer_branch = a.qt.scalarKind(p.comp) == .void_pointer or
             b.qt.scalarKind(p.comp) == .void_pointer;
@@ -6875,8 +6867,6 @@ pub const Result = struct {
             } });
             try b.implicitCast(p, .bitcast, tok);
         }
-
-        return true;
     }
 
     /// Adjust types for binary operation, returns true if the result can and should be evaluated.
@@ -6889,13 +6879,13 @@ pub const Result = struct {
         conditional,
         add,
         sub,
-    }) !bool {
+    }) !void {
         if (b.qt.isInvalid()) {
             try a.saveValue(p);
             a.qt = .invalid;
         }
         if (a.qt.isInvalid()) {
-            return false;
+            return;
         }
         try a.lvalConversion(p, tok);
         try b.lvalConversion(p, tok);
@@ -6909,24 +6899,24 @@ pub const Result = struct {
                 return a.invalidBinTy(tok, b, p);
             }
             if (a_vec.eql(b_vec, p.comp, true) and a_vec.kind == .generic) {
-                return a.shouldEval(b, p);
+                return;
             }
             if (a.qt.sizeCompare(b.qt, p.comp) == .eq) {
                 b.qt = a.qt;
                 try b.implicitCast(p, .bitcast, tok);
-                return a.shouldEval(b, p);
+                return;
             }
             try p.err(tok, .incompatible_vec_types, .{ a.qt, b.qt });
             a.val = .{};
             b.val = .{};
             a.qt = .invalid;
-            return false;
+            return;
         } else if (opt_a_vec) |a_vec| {
             if (b.coerceExtra(p, a_vec.elem, tok, .test_coerce)) {
                 try b.saveValue(p);
                 b.qt = a.qt;
                 try b.implicitCast(p, .vector_splat, tok);
-                return a.shouldEval(b, p);
+                return;
             } else |er| switch (er) {
                 error.CoercionFailed => return a.invalidBinTy(tok, b, p),
                 else => |e| return e,
@@ -6936,7 +6926,7 @@ pub const Result = struct {
                 try a.saveValue(p);
                 a.qt = b.qt;
                 try a.implicitCast(p, .vector_splat, tok);
-                return a.shouldEval(b, p);
+                return;
             } else |er| switch (er) {
                 error.CoercionFailed => return a.invalidBinTy(tok, b, p),
                 else => |e| return e,
@@ -6948,7 +6938,7 @@ pub const Result = struct {
 
         if (a_sk.isInt() and b_sk.isInt()) {
             try a.usualArithmeticConversion(b, p, tok);
-            return a.shouldEval(b, p);
+            return;
         }
         if (kind == .integer) return a.invalidBinTy(tok, b, p);
 
@@ -6958,7 +6948,7 @@ pub const Result = struct {
                 return a.invalidBinTy(tok, b, p);
 
             try a.usualArithmeticConversion(b, p, tok);
-            return a.shouldEval(b, p);
+            return;
         }
         if (kind == .arithmetic) return a.invalidBinTy(tok, b, p);
 
@@ -6973,22 +6963,21 @@ pub const Result = struct {
                 // Do integer promotions but nothing else
                 if (a_sk.isInt()) try a.castToInt(p, a.qt.promoteInt(p.comp), tok);
                 if (b_sk.isInt()) try b.castToInt(p, b.qt.promoteInt(p.comp), tok);
-                return a.shouldEval(b, p);
             },
             .relational, .equality => {
                 if (kind == .equality and (a_sk == .nullptr_t or b_sk == .nullptr_t)) {
-                    if (a_sk == .nullptr_t and b_sk == .nullptr_t) return a.shouldEval(b, p);
+                    if (a_sk == .nullptr_t and b_sk == .nullptr_t) return;
 
                     const nullptr_res = if (a_sk == .nullptr_t) a else b;
                     const other_res = if (a_sk == .nullptr_t) b else a;
 
                     if (other_res.qt.isPointer(p.comp)) {
                         try nullptr_res.nullToPointer(p, other_res.qt, tok);
-                        return other_res.shouldEval(nullptr_res, p);
+                        return;
                     } else if (other_res.val.isZero(p.comp)) {
                         other_res.val = .null;
                         try other_res.nullToPointer(p, nullptr_res.qt, tok);
-                        return other_res.shouldEval(nullptr_res, p);
+                        return;
                     }
                     return a.invalidBinTy(tok, b, p);
                 }
@@ -7019,44 +7008,42 @@ pub const Result = struct {
                     assert(b_sk.isPointer());
                     try a.castToPointer(p, b.qt, tok);
                 }
-
-                return a.shouldEval(b, p);
             },
             .conditional => {
                 // doesn't matter what we return here, as the result is ignored
                 if (a.qt.is(p.comp, .void) or b.qt.is(p.comp, .void)) {
                     try a.castToVoid(p, tok);
                     try b.castToVoid(p, tok);
-                    return true;
+                    return;
                 }
 
-                if (a_sk == .nullptr_t and b_sk == .nullptr_t) return true;
+                if (a_sk == .nullptr_t and b_sk == .nullptr_t) return;
 
                 if ((a_sk.isPointer() and b_sk.isInt()) or (a_sk.isInt() and b_sk.isPointer())) {
                     if (a.val.isZero(p.comp) or b.val.isZero(p.comp)) {
                         try a.nullToPointer(p, b.qt, tok);
                         try b.nullToPointer(p, a.qt, tok);
-                        return true;
+                        return;
                     }
                     const int_ty = if (a_sk.isInt()) a else b;
                     const ptr_ty = if (a_sk.isPointer()) a else b;
                     try p.err(tok, .implicit_int_to_ptr, .{ int_ty.qt, ptr_ty.qt });
                     try int_ty.castToPointer(p, ptr_ty.qt, tok);
 
-                    return true;
+                    return;
                 }
                 if ((a_sk.isPointer() and b_sk == .nullptr_t) or (a_sk == .nullptr_t and b_sk.isPointer())) {
                     const nullptr_res = if (a_sk == .nullptr_t) a else b;
                     const ptr_res = if (a_sk == .nullptr_t) b else a;
                     try nullptr_res.nullToPointer(p, ptr_res.qt, tok);
-                    return true;
+                    return;
                 }
                 if (a_sk.isPointer() and b_sk.isPointer()) return a.adjustCondExprPtrs(tok, b, p);
 
-                if (a.qt.is(p.comp, .storage_float) and a.qt.eql(b.qt, p.comp)) return true;
+                if (a.qt.is(p.comp, .storage_float) and a.qt.eql(b.qt, p.comp)) return;
 
                 if (a.qt.getRecord(p.comp) != null and b.qt.getRecord(p.comp) != null and a.qt.eql(b.qt, p.comp)) {
-                    return true;
+                    return;
                 }
                 return a.invalidBinTy(tok, b, p);
             },
@@ -7077,7 +7064,6 @@ pub const Result = struct {
 
                 // The result type is the type of the pointer operand
                 if (a_sk.isInt()) a.qt = b.qt else b.qt = a.qt;
-                return a.shouldEval(b, p);
             },
             .sub => {
                 // if both aren't arithmetic then either both should be pointers or just the left one.
@@ -7101,7 +7087,6 @@ pub const Result = struct {
 
                 // Do integer promotion on b if needed
                 if (b_sk.isInt()) try b.castToInt(p, b.qt.promoteInt(p.comp), tok);
-                return a.shouldEval(b, p);
             },
             else => return a.invalidBinTy(tok, b, p),
         }
@@ -7118,7 +7103,7 @@ pub const Result = struct {
 
             res.qt = try res.qt.decay(p.comp);
             try res.implicitCast(p, .array_to_pointer, tok);
-        } else if (!p.in_macro and p.tree.isLval(res.node)) {
+        } else if (p.tree.isLval(res.node)) {
             res.qt = res.qt.unqualified();
             try res.implicitCast(p, .lval_to_rval, tok);
         }
@@ -7396,7 +7381,7 @@ pub const Result = struct {
             }
         }
 
-        if (res.qt.isInt(p.comp) and !p.in_macro) {
+        if (res.qt.isInt(p.comp)) {
             if (p.tree.bitfieldWidth(res.node, true)) |width| {
                 if (res.qt.promoteBitfield(p.comp, width)) |promotion_ty| {
                     return res.castToInt(p, promotion_ty, tok);
@@ -7494,27 +7479,25 @@ pub const Result = struct {
         try b.castToInt(p, target_qt, tok);
     }
 
-    fn invalidBinTy(a: *Result, tok: TokenIndex, b: *Result, p: *Parser) Error!bool {
+    fn invalidBinTy(a: *Result, tok: TokenIndex, b: *Result, p: *Parser) Error!void {
         try p.err(tok, .invalid_bin_types, .{ a.qt, b.qt });
         a.val = .{};
         b.val = .{};
         a.qt = .invalid;
-        return false;
     }
 
-    fn shouldEval(a: *Result, b: *Result, p: *Parser) Error!bool {
-        if (p.no_eval) return false;
+    fn shouldEval(a: *Result, b: *Result, p: *Parser, eval: bool) Error!bool {
+        if (!eval) return false;
         if (a.val.opt_ref != .none and b.val.opt_ref != .none)
             return true;
 
         try a.saveValue(p);
         try b.saveValue(p);
-        return p.no_eval;
+        return false;
     }
 
     /// Saves value and replaces it with `.unavailable`.
     fn saveValue(res: *Result, p: *Parser) !void {
-        assert(!p.in_macro);
         try res.putValue(p);
         res.val = .{};
     }
@@ -7522,7 +7505,7 @@ pub const Result = struct {
     /// Saves value without altering the result.
     fn putValue(res: *const Result, p: *Parser) !void {
         if (res.val.opt_ref == .none or res.val.opt_ref == .null) return;
-        if (!p.in_macro) try p.tree.value_map.put(p.comp.gpa, res.node, res.val);
+        try p.tree.value_map.put(p.comp.gpa, res.node, res.val);
     }
 
     fn castType(res: *Result, p: *Parser, dest_qt: QualType, operand_tok: TokenIndex, l_paren: TokenIndex) !void {
@@ -8039,72 +8022,39 @@ fn expectResult(p: *Parser, res: ?Result) Error!Result {
     };
 }
 
-/// expr : assignExpr (',' assignExpr)*
 fn expr(p: *Parser) Error!?Result {
-    var expr_start = p.tok_i;
-    var prev_total = p.diagnostics.total;
-    var lhs = (try p.assignExpr()) orelse {
-        if (p.tok_ids[p.tok_i] == .comma) _ = try p.expectResult(null);
-        return null;
-    };
-    while (p.eatToken(.comma)) |comma| {
-        try lhs.maybeWarnUnused(p, expr_start, prev_total);
-        expr_start = p.tok_i;
-        prev_total = p.diagnostics.total;
+    return p.binaryExpr(.any, true);
+}
 
-        var rhs = try p.expect(assignExpr);
-        try rhs.lvalConversion(p, expr_start);
-        lhs.val = rhs.val;
-        lhs.qt = rhs.qt;
-        try lhs.bin(p, .comma_expr, rhs, comma);
+fn assignExpr(p: *Parser) Error!?Result {
+    return p.binaryExpr(.assign, true);
+}
+
+/// Returns a parse error if the expression is not an integer constant
+/// integerConstExpr : constExpr
+fn integerConstExpr(p: *Parser, decl_folding: ConstDeclFoldingMode) Error!Result {
+    const start = p.tok_i;
+    const res = try p.constExpr(decl_folding);
+    if (!res.qt.isInvalid() and !res.qt.isRealInt(p.comp)) {
+        try p.err(start, .expected_integer_constant_expr, .{});
+        return error.ParsingFailed;
     }
-    return lhs;
+    return res;
 }
 
-fn eatTag(p: *Parser, id: Token.Id) ?std.meta.Tag(Node) {
-    if (p.eatToken(id)) |_| return switch (id) {
-        .equal => .assign_expr,
-        .asterisk_equal => .mul_assign_expr,
-        .slash_equal => .div_assign_expr,
-        .percent_equal => .mod_assign_expr,
-        .plus_equal => .add_assign_expr,
-        .minus_equal => .sub_assign_expr,
-        .angle_bracket_angle_bracket_left_equal => .shl_assign_expr,
-        .angle_bracket_angle_bracket_right_equal => .shr_assign_expr,
-        .ampersand_equal => .bit_and_assign_expr,
-        .caret_equal => .bit_xor_assign_expr,
-        .pipe_equal => .bit_or_assign_expr,
-        .equal_equal => .equal_expr,
-        .bang_equal => .not_equal_expr,
-        .angle_bracket_left => .less_than_expr,
-        .angle_bracket_left_equal => .less_than_equal_expr,
-        .angle_bracket_right => .greater_than_expr,
-        .angle_bracket_right_equal => .greater_than_equal_expr,
-        .angle_bracket_angle_bracket_left => .shl_expr,
-        .angle_bracket_angle_bracket_right => .shr_expr,
-        .plus => .add_expr,
-        .minus => .sub_expr,
-        .asterisk => .mul_expr,
-        .slash => .div_expr,
-        .percent => .mod_expr,
-        else => unreachable,
-    } else return null;
-}
+/// Caller is responsible for issuing a diagnostic if result is invalid/unavailable
+/// constExpr : condExpr
+fn constExpr(p: *Parser, decl_folding: ConstDeclFoldingMode) Error!Result {
+    const const_decl_folding = p.const_decl_folding;
+    defer p.const_decl_folding = const_decl_folding;
+    p.const_decl_folding = decl_folding;
 
-fn nonAssignExpr(assign_node: std.meta.Tag(Node)) std.meta.Tag(Node) {
-    return switch (assign_node) {
-        .mul_assign_expr => .mul_expr,
-        .div_assign_expr => .div_expr,
-        .mod_assign_expr => .mod_expr,
-        .add_assign_expr => .add_expr,
-        .sub_assign_expr => .sub_expr,
-        .shl_assign_expr => .shl_expr,
-        .shr_assign_expr => .shr_expr,
-        .bit_and_assign_expr => .bit_and_expr,
-        .bit_xor_assign_expr => .bit_xor_expr,
-        .bit_or_assign_expr => .bit_or_expr,
-        else => unreachable,
-    };
+    const res = try p.expect(assignExpr);
+
+    if (res.qt.isInvalid() or res.val.opt_ref == .none) return res;
+
+    try res.putValue(p);
+    return res;
 }
 
 fn unwrapNestedOperation(p: *Parser, node_idx: Node.Index) ?Node.DeclRef {
@@ -8162,526 +8112,415 @@ fn issueConstAssignmentDiagnostics(p: *Parser, node_idx: Node.Index, tok: TokenI
     }
 }
 
+/// expr : assignExpr (',' assignExpr)*
 /// assignExpr
 ///  : condExpr
 ///  | unExpr ('=' | '*=' | '/=' | '%=' | '+=' | '-=' | '<<=' | '>>=' | '&=' | '^=' | '|=') assignExpr
-fn assignExpr(p: *Parser) Error!?Result {
-    var lhs = (try p.condExpr()) orelse return null;
-
-    const tok = p.tok_i;
-    const tag = p.eatTag(.equal) orelse
-        p.eatTag(.asterisk_equal) orelse
-        p.eatTag(.slash_equal) orelse
-        p.eatTag(.percent_equal) orelse
-        p.eatTag(.plus_equal) orelse
-        p.eatTag(.minus_equal) orelse
-        p.eatTag(.angle_bracket_angle_bracket_left_equal) orelse
-        p.eatTag(.angle_bracket_angle_bracket_right_equal) orelse
-        p.eatTag(.ampersand_equal) orelse
-        p.eatTag(.caret_equal) orelse
-        p.eatTag(.pipe_equal) orelse return lhs;
-
-    var rhs = try p.expect(assignExpr);
-
-    var is_const: bool = undefined;
-    if (!p.tree.isLvalExtra(lhs.node, &is_const) or is_const) {
-        try p.issueConstAssignmentDiagnostics(lhs.node, tok);
-        lhs.qt = .invalid;
-    }
-
-    if (tag == .assign_expr) {
-        try rhs.coerce(p, lhs.qt, tok, .assign);
-
-        try lhs.bin(p, tag, rhs, tok);
-        return lhs;
-    }
-
-    var lhs_dummy = blk: {
-        var lhs_copy = lhs;
-        try lhs_copy.un(p, .compound_assign_dummy_expr, tok);
-        try lhs_copy.lvalConversion(p, tok);
-        break :blk lhs_copy;
-    };
-    switch (tag) {
-        .mul_assign_expr,
-        .div_assign_expr,
-        .mod_assign_expr,
-        => {
-            if (!lhs.qt.isInvalid() and rhs.val.isZero(p.comp) and lhs.qt.isInt(p.comp) and rhs.qt.isInt(p.comp)) {
-                switch (tag) {
-                    .div_assign_expr => try p.err(tok, .division_by_zero, .{"division"}),
-                    .mod_assign_expr => try p.err(tok, .division_by_zero, .{"remainder"}),
-                    else => {},
-                }
-            }
-            _ = try lhs_dummy.adjustTypes(tok, &rhs, p, if (tag == .mod_assign_expr) .integer else .arithmetic);
-        },
-        .sub_assign_expr => {
-            _ = try lhs_dummy.adjustTypes(tok, &rhs, p, .sub);
-        },
-        .add_assign_expr => {
-            _ = try lhs_dummy.adjustTypes(tok, &rhs, p, .add);
-        },
-        .shl_assign_expr,
-        .shr_assign_expr,
-        .bit_and_assign_expr,
-        .bit_xor_assign_expr,
-        .bit_or_assign_expr,
-        => {
-            _ = try lhs_dummy.adjustTypes(tok, &rhs, p, .integer);
-        },
-        else => unreachable,
-    }
-
-    _ = try lhs_dummy.bin(p, nonAssignExpr(tag), rhs, tok);
-    try lhs_dummy.coerce(p, lhs.qt, tok, .assign);
-    try lhs.bin(p, tag, lhs_dummy, tok);
-    return lhs;
-}
-
-/// Returns a parse error if the expression is not an integer constant
-/// integerConstExpr : constExpr
-fn integerConstExpr(p: *Parser, decl_folding: ConstDeclFoldingMode) Error!Result {
-    const start = p.tok_i;
-    const res = try p.constExpr(decl_folding);
-    if (!res.qt.isInvalid() and !res.qt.isRealInt(p.comp)) {
-        try p.err(start, .expected_integer_constant_expr, .{});
-        return error.ParsingFailed;
-    }
-    return res;
-}
-
-/// Caller is responsible for issuing a diagnostic if result is invalid/unavailable
-/// constExpr : condExpr
-fn constExpr(p: *Parser, decl_folding: ConstDeclFoldingMode) Error!Result {
-    const const_decl_folding = p.const_decl_folding;
-    defer p.const_decl_folding = const_decl_folding;
-    p.const_decl_folding = decl_folding;
-
-    const res = try p.expect(condExpr);
-
-    if (res.qt.isInvalid() or res.val.opt_ref == .none) return res;
-
-    try res.putValue(p);
-    return res;
-}
-
 /// condExpr : lorExpr ('?' expression? ':' condExpr)?
-fn condExpr(p: *Parser) Error!?Result {
-    const cond_tok = p.tok_i;
-    var cond = (try p.lorExpr()) orelse return null;
-    if (p.eatToken(.question_mark) == null) return cond;
-    try cond.lvalConversion(p, cond_tok);
-    const saved_eval = p.no_eval;
-    const cond_known = cond.val.opt_ref != .none;
-    const cond_true = cond_known and cond.val.toBool(p.comp);
-    const cond_false = cond_known and !cond.val.toBool(p.comp);
-
-    if (cond.qt.scalarKind(p.comp) == .none) {
-        try p.err(cond_tok, .cond_expr_type, .{cond.qt});
-        return error.ParsingFailed;
-    }
-
-    // Prepare for possible binary conditional expression.
-    const maybe_colon = p.eatToken(.colon);
-
-    // If we saw a colon then this is a binary conditional expression.
-    if (maybe_colon) |colon| {
-        var else_expr = blk: {
-            defer p.no_eval = saved_eval;
-            if (cond_true) p.no_eval = true;
-            break :blk try p.expect(condExpr);
-        };
-        var cond_then = cond;
-        cond_then.node = try p.addNode(.{
-            .cond_dummy_expr = .{
-                .op_tok = colon,
-                .operand = cond.node,
-                .qt = cond.qt,
-            },
-        });
-        p.no_eval = p.no_eval or cond_known;
-        _ = try cond_then.adjustTypes(colon, &else_expr, p, .conditional);
-        p.no_eval = saved_eval;
-        if (cond_known) {
-            cond.val = if (cond_true) cond_then.val else else_expr.val;
-            try cond.putValue(p);
-        }
-        cond.qt = else_expr.qt;
-        cond.node = try p.addNode(.{
-            .binary_cond_expr = .{
-                .cond_tok = cond_tok,
-                .cond = cond.node,
-                .then_expr = cond_then.node,
-                .else_expr = else_expr.node,
-                .qt = cond.qt,
-            },
-        });
-        return cond;
-    }
-
-    // Depending on the value of the condition, avoid evaluating unreachable branches.
-    var then_expr = blk: {
-        defer p.no_eval = saved_eval;
-        if (cond_false) p.no_eval = true;
-        break :blk try p.expect(expr);
-    };
-
-    const colon = try p.expectToken(.colon);
-    var else_expr = blk: {
-        defer p.no_eval = saved_eval;
-        if (cond_true) p.no_eval = true;
-        break :blk try p.expect(condExpr);
-    };
-
-    p.no_eval = p.no_eval or cond_known;
-    _ = try then_expr.adjustTypes(colon, &else_expr, p, .conditional);
-    p.no_eval = saved_eval;
-
-    if (cond_known) {
-        cond.val = if (cond_true) then_expr.val else else_expr.val;
-        try cond.putValue(p);
-    } else {
-        try then_expr.saveValue(p);
-        try else_expr.saveValue(p);
-    }
-    cond.qt = then_expr.qt;
-    cond.node = try p.addNode(.{
-        .cond_expr = .{
-            .cond_tok = cond_tok,
-            .qt = cond.qt,
-            .cond = cond.node,
-            .then_expr = then_expr.node,
-            .else_expr = else_expr.node,
-        },
-    });
-    return cond;
-}
-
 /// lorExpr : landExpr ('||' landExpr)*
-fn lorExpr(p: *Parser) Error!?Result {
-    var lhs = (try p.landExpr()) orelse return null;
-    const saved_eval = p.no_eval;
-    defer p.no_eval = saved_eval;
-
-    while (p.eatToken(.pipe_pipe)) |tok| {
-        if (lhs.val.opt_ref != .none and lhs.val.toBool(p.comp)) p.no_eval = true;
-        var rhs = try p.expect(landExpr);
-
-        if (try lhs.adjustTypes(tok, &rhs, p, .boolean_logic)) {
-            const res = lhs.val.toBool(p.comp) or rhs.val.toBool(p.comp);
-            lhs.val = Value.fromBool(res);
-        } else {
-            lhs.val.boolCast(p.comp);
-        }
-        try lhs.boolRes(p, .bool_or_expr, rhs, tok);
-    }
-    return lhs;
-}
-
 /// landExpr : orExpr ('&&' orExpr)*
-fn landExpr(p: *Parser) Error!?Result {
-    var lhs = (try p.orExpr()) orelse return null;
-    const saved_eval = p.no_eval;
-    defer p.no_eval = saved_eval;
-
-    while (p.eatToken(.ampersand_ampersand)) |tok| {
-        if (lhs.val.opt_ref != .none and !lhs.val.toBool(p.comp)) p.no_eval = true;
-        var rhs = try p.expect(orExpr);
-
-        if (try lhs.adjustTypes(tok, &rhs, p, .boolean_logic)) {
-            const res = lhs.val.toBool(p.comp) and rhs.val.toBool(p.comp);
-            lhs.val = Value.fromBool(res);
-        } else {
-            lhs.val.boolCast(p.comp);
-        }
-        try lhs.boolRes(p, .bool_and_expr, rhs, tok);
-    }
-    return lhs;
-}
-
 /// orExpr : xorExpr ('|' xorExpr)*
-fn orExpr(p: *Parser) Error!?Result {
-    var lhs = (try p.xorExpr()) orelse return null;
-    while (p.eatToken(.pipe)) |tok| {
-        var rhs = try p.expect(xorExpr);
-
-        if (try lhs.adjustTypes(tok, &rhs, p, .integer)) {
-            lhs.val = try lhs.val.bitOr(rhs.val, p.comp);
-        }
-        try lhs.bin(p, .bit_or_expr, rhs, tok);
-    }
-    return lhs;
-}
-
 /// xorExpr : andExpr ('^' andExpr)*
-fn xorExpr(p: *Parser) Error!?Result {
-    var lhs = (try p.andExpr()) orelse return null;
-    while (p.eatToken(.caret)) |tok| {
-        var rhs = try p.expect(andExpr);
-
-        if (try lhs.adjustTypes(tok, &rhs, p, .integer)) {
-            lhs.val = try lhs.val.bitXor(rhs.val, p.comp);
-        }
-        try lhs.bin(p, .bit_xor_expr, rhs, tok);
-    }
-    return lhs;
-}
-
 /// andExpr : eqExpr ('&' eqExpr)*
-fn andExpr(p: *Parser) Error!?Result {
-    var lhs = (try p.eqExpr()) orelse return null;
-    while (p.eatToken(.ampersand)) |tok| {
-        var rhs = try p.expect(eqExpr);
-
-        if (try lhs.adjustTypes(tok, &rhs, p, .integer)) {
-            lhs.val = try lhs.val.bitAnd(rhs.val, p.comp);
-        }
-        try lhs.bin(p, .bit_and_expr, rhs, tok);
-    }
-    return lhs;
-}
-
 /// eqExpr : compExpr (('==' | '!=') compExpr)*
-fn eqExpr(p: *Parser) Error!?Result {
-    var lhs = (try p.compExpr()) orelse return null;
-    while (true) {
-        const tok = p.tok_i;
-        const tag = p.eatTag(.equal_equal) orelse
-            p.eatTag(.bang_equal) orelse break;
-        var rhs = try p.expect(compExpr);
-
-        if (try lhs.adjustTypes(tok, &rhs, p, .equality)) {
-            const op: std.math.CompareOperator = if (tag == .equal_expr) .eq else .neq;
-
-            const res: ?bool = if (lhs.qt.isPointer(p.comp) or rhs.qt.isPointer(p.comp))
-                lhs.val.comparePointers(op, rhs.val, p.comp)
-            else
-                lhs.val.compare(op, rhs.val, p.comp);
-
-            if (p.record_static_assert_eval_note and res == false) {
-                try lhs.putValue(p);
-                try rhs.putValue(p);
-            }
-            lhs.val = if (res) |val| Value.fromBool(val) else .{};
-        } else {
-            lhs.val.boolCast(p.comp);
-        }
-        try lhs.boolRes(p, tag, rhs, tok);
-    }
-    return lhs;
-}
-
 /// compExpr : shiftExpr (('<' | '<=' | '>' | '>=') shiftExpr)*
-fn compExpr(p: *Parser) Error!?Result {
-    var lhs = (try p.shiftExpr()) orelse return null;
-    while (true) {
-        const tok = p.tok_i;
-        const tag = p.eatTag(.angle_bracket_left) orelse
-            p.eatTag(.angle_bracket_left_equal) orelse
-            p.eatTag(.angle_bracket_right) orelse
-            p.eatTag(.angle_bracket_right_equal) orelse break;
-        var rhs = try p.expect(shiftExpr);
-
-        if (try lhs.adjustTypes(tok, &rhs, p, .relational)) {
-            const op: std.math.CompareOperator = switch (tag) {
-                .less_than_expr => .lt,
-                .less_than_equal_expr => .lte,
-                .greater_than_expr => .gt,
-                .greater_than_equal_expr => .gte,
-                else => unreachable,
-            };
-
-            const res: ?bool = if (lhs.qt.isPointer(p.comp) or rhs.qt.isPointer(p.comp))
-                lhs.val.comparePointers(op, rhs.val, p.comp)
-            else
-                lhs.val.compare(op, rhs.val, p.comp);
-            if (p.record_static_assert_eval_note and res == false) {
-                try lhs.putValue(p);
-                try rhs.putValue(p);
-            }
-            lhs.val = if (res) |val| Value.fromBool(val) else .{};
-        } else {
-            lhs.val.boolCast(p.comp);
-        }
-        try lhs.boolRes(p, tag, rhs, tok);
-    }
-    return lhs;
-}
-
 /// shiftExpr : addExpr (('<<' | '>>') addExpr)*
-fn shiftExpr(p: *Parser) Error!?Result {
-    var lhs = (try p.addExpr()) orelse return null;
-    while (true) {
-        const tok = p.tok_i;
-        const tag = p.eatTag(.angle_bracket_angle_bracket_left) orelse
-            p.eatTag(.angle_bracket_angle_bracket_right) orelse break;
-        var rhs = try p.expect(addExpr);
-
-        if (try lhs.adjustTypes(tok, &rhs, p, .integer)) {
-            if (rhs.val.compare(.lt, .zero, p.comp)) {
-                try p.err(tok, .negative_shift_count, .{});
-            }
-            if (rhs.val.compare(.gte, try Value.int(lhs.qt.bitSizeof(p.comp), p.comp), p.comp)) {
-                try p.err(tok, .too_big_shift_count, .{});
-            }
-            if (tag == .shl_expr) {
-                if (try lhs.val.shl(lhs.val, rhs.val, lhs.qt, p.comp) and
-                    lhs.qt.signedness(p.comp) != .unsigned) try p.err(tok, .overflow, .{lhs});
-            } else {
-                lhs.val = try lhs.val.shr(rhs.val, lhs.qt, p.comp);
-            }
-        }
-        try lhs.bin(p, tag, rhs, tok);
-    }
-    return lhs;
-}
-
 /// addExpr : mulExpr (('+' | '-') mulExpr)*
-fn addExpr(p: *Parser) Error!?Result {
-    var lhs = (try p.mulExpr()) orelse return null;
+/// mulExpr : unExpr (('*' | '/' | '%') unExpr)*´
+fn binaryExpr(p: *Parser, min_prec: Token.Precedence, eval: bool) Error!?Result {
+    var expr_start = p.tok_i;
+    var prev_total = p.diagnostics.total;
+
+    var lhs = try p.unExpr(eval) orelse {
+        if (min_prec.lt(.comma) and p.tok_ids[p.tok_i] == .comma) {
+            try p.err(p.tok_i, .expected_expr, .{});
+            return error.ParsingFailed;
+        }
+        return null;
+    };
+
     while (true) {
-        const tok = p.tok_i;
-        const tag = p.eatTag(.plus) orelse
-            p.eatTag(.minus) orelse break;
-        var rhs = try p.expect(mulExpr);
-
-        // We'll want to check this for invalid pointer arithmetic.
-        const original_lhs_qt = lhs.qt;
-
-        if (try lhs.adjustTypes(tok, &rhs, p, if (tag == .add_expr) .add else .sub)) {
-            const lhs_sk = lhs.qt.scalarKind(p.comp);
-            if (tag == .add_expr) {
-                if (try lhs.val.add(lhs.val, rhs.val, lhs.qt, p.comp)) {
-                    if (lhs_sk.isPointer()) {
-                        const increment = lhs;
-                        const ptr_bits = p.comp.type_store.intptr.bitSizeof(p.comp);
-                        const element_size = increment.qt.childType(p.comp).sizeofOrNull(p.comp) orelse 1;
-                        const max_elems = p.comp.maxArrayBytes() / element_size;
-
-                        try p.err(tok, .array_overflow, .{ increment, ptr_bits, element_size * 8, element_size, max_elems });
-                    } else if (lhs.qt.signedness(p.comp) != .unsigned) {
-                        try p.err(tok, .overflow, .{lhs});
-                    }
-                }
-            } else {
-                const elem_size = if (original_lhs_qt.isPointer(p.comp)) original_lhs_qt.childType(p.comp).sizeofOrNull(p.comp) orelse 1 else 1;
-                if (elem_size == 0 and rhs.qt.isPointer(p.comp)) {
-                    lhs.val = .{};
-                } else {
-                    if (try lhs.val.sub(lhs.val, rhs.val, lhs.qt, elem_size, p.comp) and
-                        lhs.qt.signedness(p.comp) != .unsigned)
-                    {
-                        try p.err(tok, .overflow, .{lhs});
-                    }
-                }
-            }
-        }
-        if (!lhs.qt.isInvalid()) {
-            const lhs_sk = original_lhs_qt.scalarKind(p.comp);
-            if (lhs_sk == .pointer and original_lhs_qt.childType(p.comp).hasIncompleteSize(p.comp)) {
-                try p.err(tok, .ptr_arithmetic_incomplete, .{original_lhs_qt.childType(p.comp)});
-                lhs.qt = .invalid;
-            }
-        }
-        try lhs.bin(p, tag, rhs, tok);
-    }
-    return lhs;
-}
-
-/// mulExpr : castExpr (('*' | '/' | '%') castExpr)*´
-fn mulExpr(p: *Parser) Error!?Result {
-    var lhs = (try p.castExpr()) orelse return null;
-    while (true) {
-        const tok = p.tok_i;
-        const tag = p.eatTag(.asterisk) orelse
-            p.eatTag(.slash) orelse
-            p.eatTag(.percent) orelse break;
-        var rhs = try p.expect(castExpr);
-
-        if (rhs.val.isZero(p.comp) and tag != .mul_expr and !p.no_eval and lhs.qt.isInt(p.comp) and rhs.qt.isInt(p.comp)) {
-            lhs.val = .{};
-            try p.err(tok, if (p.in_macro) .division_by_zero_macro else .division_by_zero, if (tag == .div_expr) .{"division"} else .{"remainder"});
-            if (p.in_macro) return error.ParsingFailed;
-        }
-
-        if (try lhs.adjustTypes(tok, &rhs, p, if (tag == .mod_expr) .integer else .arithmetic)) {
-            switch (tag) {
-                .mul_expr => if (try lhs.val.mul(lhs.val, rhs.val, lhs.qt, p.comp) and
-                    lhs.qt.signedness(p.comp) != .unsigned) try p.err(tok, .overflow, .{lhs}),
-                .div_expr => if (try lhs.val.div(lhs.val, rhs.val, lhs.qt, p.comp) and
-                    lhs.qt.signedness(p.comp) != .unsigned) try p.err(tok, .overflow, .{lhs}),
-                .mod_expr => {
-                    var res = try Value.rem(lhs.val, rhs.val, lhs.qt, p.comp);
-                    if (res.opt_ref == .none) {
-                        if (p.in_macro) {
-                            // match clang behavior by defining invalid remainder to be zero in macros
-                            res = .zero;
-                        } else {
-                            try lhs.saveValue(p);
-                            try rhs.saveValue(p);
-                        }
-                    }
-                    lhs.val = res;
-                },
-                else => unreachable,
-            }
-        }
-
-        try lhs.bin(p, tag, rhs, tok);
-    }
-    return lhs;
-}
-
-/// castExpr
-///  :  '(' compoundStmt ')' suffixExpr*
-///  |  '(' typeName ')' castExpr
-///  | '(' typeName ')' '{' initializerItems '}'
-///  | unExpr
-fn castExpr(p: *Parser) Error!?Result {
-    if (p.eatToken(.l_paren)) |l_paren| cast_expr: {
-        if (p.tok_ids[p.tok_i] == .l_brace) {
-            const tok = p.tok_i;
-            try p.err(p.tok_i, .gnu_statement_expression, .{});
-            if (p.func.qt == null) {
-                try p.err(p.tok_i, .stmt_expr_not_allowed_file_scope, .{});
-                return error.ParsingFailed;
-            }
-            var stmt_expr_state: StmtExprState = .{};
-            const body_node = (try p.compoundStmt(false, &stmt_expr_state)).?; // compoundStmt only returns null if .l_brace isn't the first token
-
-            var res: Result = .{
-                .node = body_node,
-                .qt = stmt_expr_state.last_expr_qt,
-            };
-            try p.expectClosing(l_paren, .r_paren);
-            try res.un(p, .stmt_expr, tok);
-            while (try p.suffixExpr(res)) |suffix| {
-                res = suffix;
-            }
-            return res;
-        }
-        const ty = (try p.typeName()) orelse {
-            p.tok_i -= 1;
-            break :cast_expr;
-        };
-        try p.expectClosing(l_paren, .r_paren);
-
-        if (p.tok_ids[p.tok_i] == .l_brace) {
-            var lhs = (try p.compoundLiteral(ty, l_paren)).?;
-            while (try p.suffixExpr(lhs)) |suffix| {
-                lhs = suffix;
-            }
+        var op_prec = Token.precedence[@backingInt(p.tok_ids[p.tok_i])];
+        if (op_prec.lt(min_prec)) {
             return lhs;
         }
 
-        const operand_tok = p.tok_i;
-        var operand = try p.expect(castExpr);
-        try operand.lvalConversion(p, operand_tok);
-        try operand.castType(p, ty, operand_tok, l_paren);
-        return operand;
+        const operator = p.tok_i;
+        p.tok_i += 1;
+
+        // Special handling for binary conditionals.
+        if (op_prec == .conditional and p.eatToken(.colon) != null) op_prec = .binary_conditional;
+
+        const eval_rhs = switch (op_prec) {
+            .bool_and, .conditional => if (lhs.val.opt_ref != .none) eval and lhs.val.toBool(p.comp) else eval,
+            .bool_or, .binary_conditional => if (lhs.val.opt_ref != .none) eval and !lhs.val.toBool(p.comp) else eval,
+            else => eval,
+        };
+        var rhs = try p.expectResult(try p.binaryExpr(op_prec.next(min_prec), eval_rhs));
+
+        switch (op_prec) {
+            _ => unreachable,
+            .comma => {
+                try lhs.maybeWarnUnused(p, expr_start, prev_total);
+                prev_total = p.diagnostics.total;
+                expr_start = operator + 1;
+
+                try lhs.lvalConversion(p, operator);
+                try rhs.lvalConversion(p, operator);
+                lhs.val = rhs.val;
+                lhs.qt = rhs.qt;
+                try lhs.bin(p, .comma_expr, rhs, operator);
+            },
+            .assign => {
+                const tag: std.meta.Tag(Node) = switch (p.tok_ids[operator]) {
+                    .equal => .assign_expr,
+                    .asterisk_equal => .mul_assign_expr,
+                    .slash_equal => .div_assign_expr,
+                    .percent_equal => .mod_assign_expr,
+                    .plus_equal => .add_assign_expr,
+                    .minus_equal => .sub_assign_expr,
+                    .angle_bracket_angle_bracket_left_equal => .shl_assign_expr,
+                    .angle_bracket_angle_bracket_right_equal => .shr_assign_expr,
+                    .ampersand_equal => .bit_and_assign_expr,
+                    .caret_equal => .bit_xor_assign_expr,
+                    .pipe_equal => .bit_or_assign_expr,
+                    else => unreachable,
+                };
+
+                var is_const: bool = undefined;
+                if (!p.tree.isLvalExtra(lhs.node, &is_const) or is_const) {
+                    try p.issueConstAssignmentDiagnostics(lhs.node, operator);
+                    lhs.qt = .invalid;
+                }
+                lhs.val = .{};
+
+                if (tag == .assign_expr) {
+                    try rhs.coerce(p, lhs.qt, operator, .assign);
+
+                    try lhs.bin(p, tag, rhs, operator);
+                    continue;
+                }
+
+                var lhs_dummy = lhs;
+                try lhs_dummy.un(p, .compound_assign_dummy_expr, operator);
+                try lhs_dummy.lvalConversion(p, operator);
+
+                switch (tag) {
+                    .mul_assign_expr,
+                    .div_assign_expr,
+                    .mod_assign_expr,
+                    => {
+                        try lhs_dummy.adjustTypes(operator, &rhs, p, if (tag == .mod_assign_expr) .integer else .arithmetic);
+                        if (eval and !lhs.qt.isInvalid() and rhs.val.isZero(p.comp) and lhs_dummy.qt.isInt(p.comp)) {
+                            switch (tag) {
+                                .div_assign_expr => try p.err(operator, .division_by_zero, .{"division"}),
+                                .mod_assign_expr => try p.err(operator, .division_by_zero, .{"remainder"}),
+                                else => {},
+                            }
+                        }
+                    },
+                    .sub_assign_expr => try lhs_dummy.adjustTypes(operator, &rhs, p, .sub),
+                    .add_assign_expr => try lhs_dummy.adjustTypes(operator, &rhs, p, .add),
+                    .shl_assign_expr,
+                    .shr_assign_expr,
+                    .bit_and_assign_expr,
+                    .bit_xor_assign_expr,
+                    .bit_or_assign_expr,
+                    => try lhs_dummy.adjustTypes(operator, &rhs, p, .integer),
+                    else => unreachable,
+                }
+
+                const non_assign_tag: std.meta.Tag(Node) = switch (tag) {
+                    .mul_assign_expr => .mul_expr,
+                    .div_assign_expr => .div_expr,
+                    .mod_assign_expr => .mod_expr,
+                    .add_assign_expr => .add_expr,
+                    .sub_assign_expr => .sub_expr,
+                    .shl_assign_expr => .shl_expr,
+                    .shr_assign_expr => .shr_expr,
+                    .bit_and_assign_expr => .bit_and_expr,
+                    .bit_xor_assign_expr => .bit_xor_expr,
+                    .bit_or_assign_expr => .bit_or_expr,
+                    else => unreachable,
+                };
+
+                _ = try lhs_dummy.bin(p, non_assign_tag, rhs, operator);
+                try lhs_dummy.coerce(p, lhs.qt, operator, .assign);
+                try lhs.bin(p, tag, lhs_dummy, operator);
+            },
+            .binary_conditional => {
+                try lhs.lvalConversion(p, operator);
+                const cond_known = lhs.val.opt_ref != .none;
+                const cond_true = cond_known and lhs.val.toBool(p.comp);
+
+                if (!lhs.qt.isInvalid() and lhs.qt.scalarKind(p.comp) == .none) {
+                    try p.err(operator, .cond_expr_type, .{lhs.qt});
+                    lhs.qt = .invalid;
+                }
+
+                const cond_node = lhs.node;
+                lhs.node = try p.addNode(.{
+                    .cond_dummy_expr = .{
+                        .op_tok = operator,
+                        .operand = lhs.node,
+                        .qt = lhs.qt,
+                    },
+                });
+                try lhs.adjustTypes(operator, &rhs, p, .conditional);
+                if (cond_known) {
+                    lhs.val = if (cond_true) lhs.val else rhs.val;
+                    try lhs.putValue(p);
+                }
+                lhs.qt = rhs.qt;
+                lhs.node = try p.addNode(.{
+                    .binary_cond_expr = .{
+                        .cond_tok = operator,
+                        .cond = cond_node,
+                        .then_expr = lhs.node,
+                        .else_expr = rhs.node,
+                        .qt = lhs.qt,
+                    },
+                });
+            },
+            .conditional => {
+                try lhs.lvalConversion(p, operator);
+                const cond_known = lhs.val.opt_ref != .none;
+                const cond_true = cond_known and lhs.val.toBool(p.comp);
+
+                if (!lhs.qt.isInvalid() and lhs.qt.scalarKind(p.comp) == .none) {
+                    try p.err(operator, .cond_expr_type, .{lhs.qt});
+                }
+
+                const colon = try p.expectToken(.colon);
+
+                var else_expr = try p.expectResult(try p.binaryExpr(op_prec, eval and !cond_true));
+
+                try rhs.adjustTypes(colon, &else_expr, p, .conditional);
+
+                lhs.qt = rhs.qt;
+                lhs.node = try p.addNode(.{
+                    .cond_expr = .{
+                        .cond_tok = operator,
+                        .qt = lhs.qt,
+                        .cond = lhs.node,
+                        .then_expr = rhs.node,
+                        .else_expr = else_expr.node,
+                    },
+                });
+
+                if (cond_known) {
+                    lhs.val = if (cond_true) rhs.val else else_expr.val;
+                    try lhs.putValue(p);
+                } else {
+                    try rhs.saveValue(p);
+                    try else_expr.saveValue(p);
+                }
+            },
+            .bool_or => {
+                try lhs.adjustTypes(operator, &rhs, p, .boolean_logic);
+                if (try lhs.shouldEval(&rhs, p, eval)) {
+                    lhs.val = .fromBool(lhs.val.toBool(p.comp) or rhs.val.toBool(p.comp));
+                } else {
+                    lhs.val.boolCast(p.comp);
+                }
+                try lhs.boolRes(p, .bool_or_expr, rhs, operator);
+            },
+            .bool_and => {
+                try lhs.adjustTypes(operator, &rhs, p, .boolean_logic);
+                if (try lhs.shouldEval(&rhs, p, eval)) {
+                    lhs.val = .fromBool(lhs.val.toBool(p.comp) and rhs.val.toBool(p.comp));
+                } else {
+                    lhs.val.boolCast(p.comp);
+                }
+                try lhs.boolRes(p, .bool_and_expr, rhs, operator);
+            },
+            .bit_or => {
+                try lhs.adjustTypes(operator, &rhs, p, .integer);
+                if (try lhs.shouldEval(&rhs, p, eval)) {
+                    lhs.val = try lhs.val.bitOr(rhs.val, p.comp);
+                }
+                try lhs.bin(p, .bit_or_expr, rhs, operator);
+            },
+            .bit_xor => {
+                try lhs.adjustTypes(operator, &rhs, p, .integer);
+                if (try lhs.shouldEval(&rhs, p, eval)) {
+                    lhs.val = try lhs.val.bitXor(rhs.val, p.comp);
+                }
+                try lhs.bin(p, .bit_xor_expr, rhs, operator);
+            },
+            .bit_and => {
+                try lhs.adjustTypes(operator, &rhs, p, .integer);
+                if (try lhs.shouldEval(&rhs, p, eval)) {
+                    lhs.val = try lhs.val.bitAnd(rhs.val, p.comp);
+                }
+                try lhs.bin(p, .bit_and_expr, rhs, operator);
+            },
+            .equality => {
+                const tag: std.meta.Tag(Node) = switch (p.tok_ids[operator]) {
+                    .equal_equal => .equal_expr,
+                    .bang_equal => .not_equal_expr,
+                    else => unreachable,
+                };
+
+                try lhs.adjustTypes(operator, &rhs, p, .equality);
+                if (try lhs.shouldEval(&rhs, p, eval)) {
+                    const op: std.math.CompareOperator = if (tag == .equal_expr) .eq else .neq;
+
+                    const res: ?bool = if (lhs.qt.isPointer(p.comp) or rhs.qt.isPointer(p.comp))
+                        lhs.val.comparePointers(op, rhs.val, p.comp)
+                    else
+                        lhs.val.compare(op, rhs.val, p.comp);
+
+                    if (p.record_static_assert_eval_note and res == false) {
+                        try lhs.putValue(p);
+                        try rhs.putValue(p);
+                    }
+                    lhs.val = if (res) |val| .fromBool(val) else .{};
+                } else {
+                    lhs.val.boolCast(p.comp);
+                }
+                try lhs.boolRes(p, tag, rhs, operator);
+            },
+            .comparison => {
+                const tag: std.meta.Tag(Node) = switch (p.tok_ids[operator]) {
+                    .angle_bracket_left => .less_than_expr,
+                    .angle_bracket_left_equal => .less_than_equal_expr,
+                    .angle_bracket_right => .greater_than_expr,
+                    .angle_bracket_right_equal => .greater_than_equal_expr,
+                    else => unreachable,
+                };
+
+                try lhs.adjustTypes(operator, &rhs, p, .relational);
+                if (try lhs.shouldEval(&rhs, p, eval)) {
+                    const op: std.math.CompareOperator = switch (tag) {
+                        .less_than_expr => .lt,
+                        .less_than_equal_expr => .lte,
+                        .greater_than_expr => .gt,
+                        .greater_than_equal_expr => .gte,
+                        else => unreachable,
+                    };
+
+                    const res: ?bool = if (lhs.qt.isPointer(p.comp) or rhs.qt.isPointer(p.comp))
+                        lhs.val.comparePointers(op, rhs.val, p.comp)
+                    else
+                        lhs.val.compare(op, rhs.val, p.comp);
+                    if (p.record_static_assert_eval_note and res == false) {
+                        try lhs.putValue(p);
+                        try rhs.putValue(p);
+                    }
+                    lhs.val = if (res) |val| .fromBool(val) else .{};
+                } else {
+                    lhs.val.boolCast(p.comp);
+                }
+                try lhs.boolRes(p, tag, rhs, operator);
+            },
+            .shift => {
+                const tag: std.meta.Tag(Node) = switch (p.tok_ids[operator]) {
+                    .angle_bracket_angle_bracket_left => .shl_expr,
+                    .angle_bracket_angle_bracket_right => .shr_expr,
+                    else => unreachable,
+                };
+
+                try lhs.adjustTypes(operator, &rhs, p, .integer);
+                if (try lhs.shouldEval(&rhs, p, eval)) {
+                    if (rhs.val.compare(.lt, .zero, p.comp)) {
+                        try p.err(operator, .negative_shift_count, .{});
+                    }
+                    if (rhs.val.compare(.gte, try .int(lhs.qt.bitSizeof(p.comp), p.comp), p.comp)) {
+                        try p.err(operator, .too_big_shift_count, .{});
+                    }
+                    if (tag == .shl_expr) {
+                        if (try lhs.val.shl(lhs.val, rhs.val, lhs.qt, p.comp) and
+                            lhs.qt.signedness(p.comp) != .unsigned) try p.err(operator, .overflow, .{lhs});
+                    } else {
+                        lhs.val = try lhs.val.shr(rhs.val, lhs.qt, p.comp);
+                    }
+                }
+                try lhs.bin(p, tag, rhs, operator);
+            },
+            .additive => {
+                const tag: std.meta.Tag(Node) = switch (p.tok_ids[operator]) {
+                    .plus => .add_expr,
+                    .minus => .sub_expr,
+                    else => unreachable,
+                };
+                // We'll want to check this for invalid pointer arithmetic.
+                const original_lhs_qt = lhs.qt;
+
+                try lhs.adjustTypes(operator, &rhs, p, if (tag == .add_expr) .add else .sub);
+                if (try lhs.shouldEval(&rhs, p, eval)) {
+                    const lhs_sk = lhs.qt.scalarKind(p.comp);
+                    if (tag == .add_expr) {
+                        if (try lhs.val.add(lhs.val, rhs.val, lhs.qt, p.comp)) {
+                            if (lhs_sk.isPointer()) {
+                                const increment = lhs;
+                                const ptr_bits = p.comp.type_store.intptr.bitSizeof(p.comp);
+                                const element_size = increment.qt.childType(p.comp).sizeofOrNull(p.comp) orelse 1;
+                                const max_elems = p.comp.maxArrayBytes() / element_size;
+
+                                try p.err(operator, .array_overflow, .{ increment, ptr_bits, element_size * 8, element_size, max_elems });
+                            } else if (lhs.qt.signedness(p.comp) != .unsigned) {
+                                try p.err(operator, .overflow, .{lhs});
+                            }
+                        }
+                    } else {
+                        const elem_size = if (original_lhs_qt.isPointer(p.comp)) original_lhs_qt.childType(p.comp).sizeofOrNull(p.comp) orelse 1 else 1;
+                        if (elem_size == 0 and rhs.qt.isPointer(p.comp)) {
+                            lhs.val = .{};
+                        } else {
+                            if (try lhs.val.sub(lhs.val, rhs.val, lhs.qt, elem_size, p.comp) and
+                                lhs.qt.signedness(p.comp) != .unsigned)
+                            {
+                                try p.err(operator, .overflow, .{lhs});
+                            }
+                        }
+                    }
+                }
+                if (!lhs.qt.isInvalid()) {
+                    const lhs_sk = original_lhs_qt.scalarKind(p.comp);
+                    if (lhs_sk == .pointer and original_lhs_qt.childType(p.comp).hasIncompleteSize(p.comp)) {
+                        try p.err(operator, .ptr_arithmetic_incomplete, .{original_lhs_qt.childType(p.comp)});
+                        lhs.qt = .invalid;
+                    }
+                }
+                try lhs.bin(p, tag, rhs, operator);
+            },
+            .multiplicative => {
+                const tag: std.meta.Tag(Node) = switch (p.tok_ids[operator]) {
+                    .asterisk => .mul_expr,
+                    .slash => .div_expr,
+                    .percent => .mod_expr,
+                    else => unreachable,
+                };
+
+                try lhs.adjustTypes(operator, &rhs, p, if (tag == .mod_expr) .integer else .arithmetic);
+                if (eval and tag != .mul_expr and !lhs.qt.isInvalid() and lhs.qt.isInt(p.comp) and rhs.val.isZero(p.comp)) {
+                    lhs.val = .{};
+                    try p.err(operator, .division_by_zero, if (tag == .div_expr) .{"division"} else .{"remainder"});
+                }
+
+                if (try lhs.shouldEval(&rhs, p, eval)) {
+                    switch (tag) {
+                        .mul_expr => if (try lhs.val.mul(lhs.val, rhs.val, lhs.qt, p.comp) and
+                            lhs.qt.signedness(p.comp) != .unsigned) try p.err(operator, .overflow, .{lhs}),
+                        .div_expr => if (try lhs.val.div(lhs.val, rhs.val, lhs.qt, p.comp) and
+                            lhs.qt.signedness(p.comp) != .unsigned) try p.err(operator, .overflow, .{lhs}),
+                        .mod_expr => {
+                            const res = try Value.rem(lhs.val, rhs.val, lhs.qt, p.comp);
+                            if (res.opt_ref == .none) {
+                                try lhs.saveValue(p);
+                                try rhs.saveValue(p);
+                            }
+                            lhs.val = res;
+                        },
+                        else => unreachable,
+                    }
+                }
+
+                try lhs.bin(p, tag, rhs, operator);
+            },
+        }
     }
-    return p.unExpr();
 }
 
 /// builtinBitCast : __builtin_bit_cast '(' typeName ',' assignExpr ')'
@@ -8855,17 +8694,9 @@ fn builtinChooseExpr(p: *Parser) Error!Result {
 
     _ = try p.expectToken(.comma);
 
-    const then_expr = if (cond.val.toBool(p.comp))
-        try p.expect(assignExpr)
-    else
-        try p.parseNoEval(assignExpr);
-
+    const then_expr = try p.expectResult(try p.binaryExpr(.conditional, cond.val.toBool(p.comp)));
     _ = try p.expectToken(.comma);
-
-    const else_expr = if (!cond.val.toBool(p.comp))
-        try p.expect(assignExpr)
-    else
-        try p.parseNoEval(assignExpr);
+    const else_expr = try p.expectResult(try p.binaryExpr(.conditional, !cond.val.toBool(p.comp)));
 
     try p.expectClosing(l_paren, .r_paren);
 
@@ -9155,14 +8986,14 @@ fn computeOffset(p: *Parser, res: Result) !Value {
 }
 
 /// unExpr
-///  : (compoundLiteral | primaryExpr) suffixExpr*
+///  : primaryExpr suffixExpr*
+///  | ('&' | '*' | '+' | '-' | '~' | '!' | '++' | '--' | keyword_extension | keyword_imag | keyword_real) unExpr
 ///  | '&&' IDENTIFIER
-///  | ('&' | '*' | '+' | '-' | '~' | '!' | '++' | '--' | keyword_extension | keyword_imag | keyword_real) castExpr
 ///  | keyword_sizeof unExpr
 ///  | keyword_sizeof '(' typeName ')'
 ///  | keyword_alignof '(' typeName ')'
 ///  | keyword_c23_alignof '(' typeName ')'
-fn unExpr(p: *Parser) Error!?Result {
+fn unExpr(p: *Parser, eval: bool) Error!?Result {
     const gpa = p.comp.gpa;
     const tok = p.tok_i;
     switch (p.tok_ids[tok]) {
@@ -9189,13 +9020,9 @@ fn unExpr(p: *Parser) Error!?Result {
             };
         },
         .ampersand => {
-            if (p.in_macro) {
-                try p.err(p.tok_i, .invalid_preproc_operator, .{});
-                return error.ParsingFailed;
-            }
             const orig_tok_i = p.tok_i;
             p.tok_i += 1;
-            var operand = try p.expect(castExpr);
+            var operand = try p.expectResult(try p.unExpr(eval));
             var addr_val: Value = .{};
 
             if (p.getNode(operand.node, .member_access_expr) orelse
@@ -9242,7 +9069,7 @@ fn unExpr(p: *Parser) Error!?Result {
         },
         .asterisk => {
             p.tok_i += 1;
-            var operand = try p.expect(castExpr);
+            var operand = try p.expectResult(try p.unExpr(eval));
 
             switch (operand.qt.base(p.comp).type) {
                 .array, .func, .pointer => {
@@ -9266,7 +9093,7 @@ fn unExpr(p: *Parser) Error!?Result {
         .plus => {
             p.tok_i += 1;
 
-            var operand = try p.expect(castExpr);
+            var operand = try p.expectResult(try p.unExpr(eval));
             try operand.lvalConversion(p, tok);
             const scalar_qt = if (operand.qt.get(p.comp, .vector)) |vec| vec.elem else operand.qt;
             if (!scalar_qt.isInt(p.comp) and !scalar_qt.isFloat(p.comp))
@@ -9279,7 +9106,7 @@ fn unExpr(p: *Parser) Error!?Result {
         .minus => {
             p.tok_i += 1;
 
-            var operand = try p.expect(castExpr);
+            var operand = try p.expectResult(try p.unExpr(eval));
             try operand.lvalConversion(p, tok);
             const scalar_qt = if (operand.qt.get(p.comp, .vector)) |vec| vec.elem else operand.qt;
             if (!scalar_qt.isInt(p.comp) and !scalar_qt.isFloat(p.comp))
@@ -9297,7 +9124,7 @@ fn unExpr(p: *Parser) Error!?Result {
         .plus_plus => {
             p.tok_i += 1;
 
-            var operand = try p.expect(castExpr);
+            var operand = try p.expectResult(try p.unExpr(eval));
             const scalar_kind = operand.qt.scalarKind(p.comp);
             if (scalar_kind == .void_pointer)
                 try p.err(tok, .gnu_pointer_arith, .{});
@@ -9327,7 +9154,7 @@ fn unExpr(p: *Parser) Error!?Result {
         .minus_minus => {
             p.tok_i += 1;
 
-            var operand = try p.expect(castExpr);
+            var operand = try p.expectResult(try p.unExpr(eval));
             const scalar_kind = operand.qt.scalarKind(p.comp);
             if (scalar_kind == .void_pointer)
                 try p.err(tok, .gnu_pointer_arith, .{});
@@ -9357,7 +9184,7 @@ fn unExpr(p: *Parser) Error!?Result {
         .tilde => {
             p.tok_i += 1;
 
-            var operand = try p.expect(castExpr);
+            var operand = try p.expectResult(try p.unExpr(eval));
             try operand.lvalConversion(p, tok);
             try operand.usualUnaryConversion(p, tok);
 
@@ -9382,7 +9209,7 @@ fn unExpr(p: *Parser) Error!?Result {
         .bang => {
             p.tok_i += 1;
 
-            var operand = try p.expect(castExpr);
+            var operand = try p.expectResult(try p.unExpr(eval));
             try operand.lvalConversion(p, tok);
             if (operand.qt.scalarKind(p.comp) == .none)
                 try p.err(tok, .invalid_argument_un, .{operand.qt});
@@ -9414,16 +9241,20 @@ fn unExpr(p: *Parser) Error!?Result {
                 res.qt = qt;
                 try p.err(expected_paren, .expected_parens_around_typename, .{});
             } else if (p.eatToken(.l_paren)) |l_paren| {
-                if (try p.typeName()) |ty| {
-                    res.qt = ty;
+                if (try p.typeName()) |qt| {
+                    res.qt = qt;
                     try p.expectClosing(l_paren, .r_paren);
+                    if (p.tok_ids[p.tok_i] == .l_brace) {
+                        res = try p.compoundLiteral(l_paren, .{ .qt = qt });
+                        has_expr = true;
+                    }
                 } else {
                     p.tok_i = expected_paren;
-                    res = try p.parseNoEval(unExpr);
+                    res = try p.expectResult(try p.unExpr(false));
                     has_expr = true;
                 }
             } else {
-                res = try p.parseNoEval(unExpr);
+                res = try p.expectResult(try p.unExpr(false));
                 has_expr = true;
             }
             const operand_qt = res.qt;
@@ -9484,19 +9315,20 @@ fn unExpr(p: *Parser) Error!?Result {
                 if (try p.typeName()) |qt| {
                     res.qt = qt;
                     try p.expectClosing(l_paren, .r_paren);
+                    if (p.tok_ids[p.tok_i] == .l_brace) {
+                        res = try p.compoundLiteral(l_paren, .{ .qt = qt });
+                        has_expr = true;
+                    }
                 } else {
                     p.tok_i = expected_paren;
-                    res = try p.parseNoEval(unExpr);
+                    res = try p.expectResult(try p.unExpr(false));
                     has_expr = true;
-
-                    try p.err(expected_paren, .alignof_expr, .{});
                 }
             } else {
-                res = try p.parseNoEval(unExpr);
+                res = try p.expectResult(try p.unExpr(false));
                 has_expr = true;
-
-                try p.err(expected_paren, .alignof_expr, .{});
             }
+            if (has_expr) try p.err(expected_paren, .alignof_expr, .{p.tokSlice(tok)});
             const operand_qt = res.qt;
 
             if (res.qt.is(p.comp, .void)) {
@@ -9529,13 +9361,13 @@ fn unExpr(p: *Parser) Error!?Result {
             defer p.extension_suppressed = saved_extension;
             p.extension_suppressed = true;
 
-            return try p.expect(castExpr);
+            return try p.expectResult(try p.unExpr(eval));
         },
         .keyword_imag1, .keyword_imag2 => {
             const imag_tok = p.tok_i;
             p.tok_i += 1;
 
-            var operand = try p.expect(castExpr);
+            var operand = try p.expectResult(try p.unExpr(eval));
             try operand.lvalConversion(p, tok);
             if (operand.qt.isInvalid()) return operand;
 
@@ -9565,7 +9397,7 @@ fn unExpr(p: *Parser) Error!?Result {
             const real_tok = p.tok_i;
             p.tok_i += 1;
 
-            var operand = try p.expect(castExpr);
+            var operand = try p.expectResult(try p.unExpr(eval));
             try operand.lvalConversion(p, tok);
             if (operand.qt.isInvalid()) return operand;
             if (!operand.qt.isInt(p.comp) and !operand.qt.isFloat(p.comp)) {
@@ -9578,10 +9410,7 @@ fn unExpr(p: *Parser) Error!?Result {
             return operand;
         },
         else => {
-            var lhs = (try p.compoundLiteral(null, null)) orelse
-                (try p.primaryExpr()) orelse
-                return null;
-
+            var lhs = (try p.primaryExpr(eval)) orelse return null;
             while (try p.suffixExpr(lhs)) |suffix| {
                 lhs = suffix;
             }
@@ -9593,37 +9422,17 @@ fn unExpr(p: *Parser) Error!?Result {
 /// compoundLiteral
 ///  : '(' storageClassSpec* type_name ')' '{' initializer_list '}'
 ///  | '(' storageClassSpec* type_name ')' '{' initializer_list ',' '}'
-fn compoundLiteral(p: *Parser, qt_opt: ?QualType, opt_l_paren: ?TokenIndex) Error!?Result {
-    const l_paren, const d = if (qt_opt) |some| .{ opt_l_paren.?, DeclSpec{ .qt = some } } else blk: {
-        const l_paren = p.eatToken(.l_paren) orelse return null;
-
-        var d: DeclSpec = .{ .qt = .invalid };
-        const any = if (p.comp.langopts.standard.atLeast(.c23))
-            try p.storageClassSpec(&d)
-        else
-            false;
-
-        switch (d.storage_class) {
-            .auto, .@"extern", .typedef => |tok| {
-                try p.err(tok, .invalid_compound_literal_storage_class, .{@tagName(d.storage_class)});
-                d.storage_class = .none;
-            },
-            .register => if (p.func.qt == null) try p.err(p.tok_i, .register_on_global_compound_literal, .{}),
-            else => {},
-        }
-
-        d.qt = (try p.typeName()) orelse {
-            p.tok_i = l_paren;
-            if (any) {
-                try p.err(p.tok_i, .expected_type, .{});
-                return error.ParsingFailed;
-            }
-            return null;
-        };
-        try p.expectClosing(l_paren, .r_paren);
-        break :blk .{ l_paren, d };
-    };
-    var qt = d.qt;
+fn compoundLiteral(p: *Parser, l_paren: TokenIndex, decl_spec: DeclSpec) Error!Result {
+    var d = decl_spec;
+    switch (d.storage_class) {
+        .auto, .@"extern", .typedef => |tok| {
+            try p.err(tok, .invalid_compound_literal_storage_class, .{@tagName(d.storage_class)});
+            d.storage_class = .none;
+        },
+        .register => if (p.func.qt == null) try p.err(p.tok_i, .register_on_global_compound_literal, .{}),
+        .static, .none => {},
+    }
+    const qt = d.qt;
 
     var incomplete_array_ty = false;
     switch (qt.base(p.comp).type) {
@@ -10462,6 +10271,8 @@ fn checkArrayBounds(p: *Parser, index: Result, array: Result, tok: TokenIndex) !
 ///  | CHAR_LITERAL
 ///  | STRING_LITERAL
 ///  | '(' expr ')'
+///  | '(' compoundStmt ')'
+///  | compoundLiteral
 ///  | genericSelection
 ///  | shufflevector
 ///  | convertvector
@@ -10469,16 +10280,79 @@ fn checkArrayBounds(p: *Parser, index: Result, array: Result, tok: TokenIndex) !
 ///  | chooseExpr
 ///  | vaStart
 ///  | offsetof
-fn primaryExpr(p: *Parser) Error!?Result {
-    if (p.eatToken(.l_paren)) |l_paren| {
-        var grouped_expr = try p.expectWithClosing(expr, .r_paren);
-        try p.expectClosing(l_paren, .r_paren);
-        try grouped_expr.un(p, .paren_expr, l_paren);
-        return grouped_expr;
-    }
-
+fn primaryExpr(p: *Parser, eval: bool) Error!?Result {
     const gpa = p.comp.gpa;
     switch (p.tok_ids[p.tok_i]) {
+        .l_paren => {
+            const l_paren = p.tok_i;
+            p.tok_i += 1;
+
+            // Statement expression ({ ... })
+            if (p.tok_ids[p.tok_i] == .l_brace) {
+                const l_brace = p.tok_i;
+
+                try p.err(l_brace, .gnu_statement_expression, .{});
+                if (p.func.qt == null) {
+                    try p.err(l_brace, .stmt_expr_not_allowed_file_scope, .{});
+                    return error.ParsingFailed;
+                }
+                var stmt_expr_state: StmtExprState = .{};
+                const body_node = (try p.compoundStmt(false, &stmt_expr_state)).?; // compoundStmt only returns null if .l_brace isn't the first token
+
+                var res: Result = .{
+                    .node = body_node,
+                    .qt = stmt_expr_state.last_expr_qt,
+                };
+                try p.expectClosing(l_paren, .r_paren);
+                try res.un(p, .stmt_expr, l_brace);
+                return res;
+            }
+
+            var decl_spec: DeclSpec = .{ .qt = .invalid };
+            const any = if (p.comp.langopts.standard.atLeast(.c23))
+                try p.storageClassSpec(&decl_spec)
+            else
+                false;
+
+            if (try p.typeName()) |ty| {
+                try p.expectClosing(l_paren, .r_paren);
+
+                // Compound literal (type){ ... }
+                if (p.tok_ids[p.tok_i] == .l_brace) {
+                    decl_spec.qt = ty;
+                    return try p.compoundLiteral(l_paren, decl_spec);
+                } else if (any) {
+                    try p.err(l_paren + 1, .expected_expr, .{});
+                    return error.ParsingFailed;
+                }
+
+                // Cast (type)unExpr
+                const operand_tok = p.tok_i;
+                var operand = try p.expectResult(try p.unExpr(eval));
+                try operand.lvalConversion(p, operand_tok);
+                try operand.castType(p, ty, operand_tok, l_paren);
+                return operand;
+            } else if (any) {
+                // If we saw a storage class specifier then this should
+                // have been a compound literal
+                try p.err(p.tok_i, .expected_type, .{});
+                return error.ParsingFailed;
+            }
+
+            // Grouped expression (expr)
+            var grouped_expr = (p.binaryExpr(.any, eval) catch |er| {
+                if (er == error.ParsingFailed) p.skipTo(.r_paren);
+                return er;
+            }) orelse {
+                try p.err(p.tok_i, .expected_expr, .{});
+                p.skipTo(.r_paren);
+                return error.ParsingFailed;
+            };
+
+            try p.expectClosing(l_paren, .r_paren);
+            try grouped_expr.un(p, .paren_expr, l_paren);
+            return grouped_expr;
+        },
         .identifier, .extended_identifier => {
             const name_tok = try p.expectIdentifier();
             const name = p.tokSlice(name_tok);
@@ -10644,7 +10518,6 @@ fn primaryExpr(p: *Parser) Error!?Result {
                     },
                 }),
             };
-            std.debug.assert(!p.in_macro); // Should have been replaced with .one / .zero
             try res.putValue(p);
             return res;
         },
@@ -10751,31 +10624,8 @@ fn primaryExpr(p: *Parser) Error!?Result {
         .empty_char_literal,
         .unterminated_char_literal,
         => return try p.charLiteral(),
-        .zero => {
-            defer p.tok_i += 1;
-            const int_qt: QualType = if (p.in_macro) p.comp.type_store.intmax else .int;
-            const res: Result = .{
-                .val = .zero,
-                .qt = int_qt,
-                .node = try p.addNode(.{ .int_literal = .{ .qt = int_qt, .literal_tok = p.tok_i } }),
-            };
-            try res.putValue(p);
-            return res;
-        },
-        .one => {
-            defer p.tok_i += 1;
-            const int_qt: QualType = if (p.in_macro) p.comp.type_store.intmax else .int;
-            const res: Result = .{
-                .val = .one,
-                .qt = int_qt,
-                .node = try p.addNode(.{ .int_literal = .{ .qt = int_qt, .literal_tok = p.tok_i } }),
-            };
-            try res.putValue(p);
-            return res;
-        },
         .pp_num => return try p.ppNum(),
         .embed_byte => {
-            assert(!p.in_macro);
             const loc = p.pp.tokens.items(.loc)[p.tok_i];
             defer p.tok_i += 1;
             const buf = p.comp.getSource(.generated).buf[loc.byte_offset..];
@@ -10808,7 +10658,7 @@ fn makePredefinedIdentifier(p: *Parser, slice: []const u8) !Result {
     const val = try Value.intern(p.comp, .{ .bytes = slice });
 
     const str_lit = try p.addNode(.{ .string_literal_expr = .{ .qt = array_qt, .literal_tok = p.tok_i, .kind = .ascii } });
-    if (!p.in_macro) try p.tree.value_map.put(gpa, str_lit, val);
+    try p.tree.value_map.put(gpa, str_lit, val);
 
     return .{ .qt = array_qt, .node = try p.addNode(.{
         .variable = .{
@@ -10962,127 +10812,42 @@ fn stringLiteral(p: *Parser) Error!Result {
 }
 
 fn charLiteral(p: *Parser) Error!?Result {
-    defer p.tok_i += 1;
-    const tok_id = p.tok_ids[p.tok_i];
+    const literal = p.tok_i;
+    p.tok_i += 1;
+
+    const tok_id = p.tok_ids[literal];
     const char_kind = text_literal.Kind.classify(tok_id, .char_literal) orelse {
         if (tok_id == .empty_char_literal) {
-            try p.err(p.tok_i, .empty_char_literal_error, .{});
+            try p.err(literal, .empty_char_literal_error, .{});
         } else if (tok_id == .unterminated_char_literal) {
-            try p.err(p.tok_i, .unterminated_char_literal_error, .{});
+            try p.err(literal, .unterminated_char_literal_error, .{});
         } else unreachable;
         return .{
             .qt = .int,
             .val = .zero,
-            .node = try p.addNode(.{ .char_literal = .{ .qt = .int, .literal_tok = p.tok_i, .kind = .ascii } }),
+            .node = try p.addNode(.{ .char_literal = .{ .qt = .int, .literal_tok = literal, .kind = .ascii } }),
         };
     };
-    if (char_kind == .utf_8) try p.err(p.tok_i, .u8_char_lit, .{});
-    var val: u32 = 0;
 
-    const gpa = p.comp.gpa;
-    const slice = char_kind.contentSlice(p.tokSlice(p.tok_i));
-
-    var is_multichar = false;
-    if (slice.len == 1 and std.ascii.isAscii(slice[0])) {
-        // fast path: single unescaped ASCII char
-        val = slice[0];
-    } else {
-        const max_codepoint = char_kind.maxCodepoint(p.comp);
-        var char_literal_parser: text_literal.Parser = .{
-            .comp = p.comp,
-            .literal = slice,
-            .kind = char_kind,
-            .max_codepoint = max_codepoint,
-            .loc = p.pp.tokens.items(.loc)[p.tok_i],
-            .expansion_locs = p.pp.expansionSlice(p.tok_i),
-        };
-
-        const max_chars_expected = 4;
-        var bfa_buf: [max_chars_expected]u32 = undefined;
-        var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&bfa_buf), gpa);
-        const allocator = bfa.allocator();
-        var chars: std.ArrayList(u32) = .empty;
-        defer chars.deinit(allocator);
-
-        chars.ensureUnusedCapacity(allocator, max_chars_expected) catch unreachable; // stack allocation already succeeded
-
-        while (try char_literal_parser.next()) |item| switch (item) {
-            .value => |v| try chars.append(allocator, v),
-            .codepoint => |c| try chars.append(allocator, c),
-            .improperly_encoded => |s| {
-                try chars.ensureUnusedCapacity(allocator, s.len);
-                for (s) |c| chars.appendAssumeCapacity(c);
-            },
-            .utf8_text => |view| {
-                var it = view.iterator();
-                var max_codepoint_seen: u21 = 0;
-                try chars.ensureUnusedCapacity(allocator, view.bytes.len);
-                while (it.nextCodepoint()) |c| {
-                    max_codepoint_seen = @max(max_codepoint_seen, c);
-                    chars.appendAssumeCapacity(c);
-                }
-                if (max_codepoint_seen > max_codepoint) {
-                    try char_literal_parser.err(.char_too_large, .{});
-                }
-            },
-        };
-
-        is_multichar = chars.items.len > 1;
-        if (is_multichar) {
-            if (char_kind == .char and chars.items.len == 4) {
-                try char_literal_parser.warn(.four_char_char_literal, .{});
-            } else if (char_kind == .char) {
-                try char_literal_parser.warn(.multichar_literal_warning, .{});
-            } else {
-                const kind: []const u8 = switch (char_kind) {
-                    .wide => "wide",
-                    .utf_8, .utf_16, .utf_32 => "Unicode",
-                    else => unreachable,
-                };
-                try char_literal_parser.err(.invalid_multichar_literal, .{kind});
-            }
-        }
-
-        var multichar_overflow = false;
-        if (char_kind == .char and is_multichar) {
-            for (chars.items) |item| {
-                val, const overflowed = @shlWithOverflow(val, 8);
-                multichar_overflow = multichar_overflow or overflowed != 0;
-                val += @as(u8, @truncate(item));
-            }
-        } else if (chars.items.len > 0) {
-            val = chars.items[chars.items.len - 1];
-        }
-
-        if (multichar_overflow) {
-            try char_literal_parser.err(.char_lit_too_wide, .{});
-        }
-    }
+    var char_literal_parser: text_literal.Parser = .{
+        .comp = p.comp,
+        .literal = char_kind.contentSlice(p.tokSlice(literal)),
+        .kind = char_kind,
+        .max_codepoint = char_kind.maxCodepoint(p.comp),
+        .loc = p.pp.tokens.items(.loc)[literal],
+        .expansion_locs = p.pp.expansionSlice(literal),
+    };
+    const parsed = try char_literal_parser.parse();
 
     const char_literal_qt = char_kind.charLiteralType(p.comp);
-    // This is the type the literal will have if we're in a macro; macros always operate on intmax_t/uintmax_t values
-    const macro_qt = if (char_literal_qt.signedness(p.comp) == .unsigned or
-        (char_kind == .char and p.comp.getCharSignedness() == .unsigned))
-        try p.comp.type_store.intmax.makeIntUnsigned(p.comp)
-    else
-        p.comp.type_store.intmax;
-
-    var value = try Value.int(val, p.comp);
-    // C99 6.4.4.4.10
-    // > If an integer character constant contains a single character or escape sequence,
-    // > its value is the one that results when an object with type char whose value is
-    // > that of the single character or escape sequence is converted to type int.
-    // This conversion only matters if `char` is signed and has a high-order bit of `1`
-    if (char_kind == .char and !is_multichar and val > 0x7F and p.comp.getCharSignedness() == .signed) {
-        _ = try value.intCast(.char, p.comp);
-    }
-
     const res: Result = .{
-        .qt = if (p.in_macro) macro_qt else char_literal_qt,
-        .val = value,
+        .qt = char_literal_qt,
+        .val = switch (parsed) {
+            inline else => |v| try Value.int(v, p.comp),
+        },
         .node = try p.addNode(.{ .char_literal = .{
             .qt = char_literal_qt,
-            .literal_tok = p.tok_i,
+            .literal_tok = literal,
             .kind = switch (char_kind) {
                 .char, .unterminated => .ascii,
                 .wide => .wide,
@@ -11092,11 +10857,11 @@ fn charLiteral(p: *Parser) Error!?Result {
             },
         } }),
     };
-    if (!p.in_macro) try p.tree.value_map.put(gpa, res.node, res.val);
+    try p.tree.value_map.put(p.comp.gpa, res.node, res.val);
     return res;
 }
 
-fn parseFloat(p: *Parser, buf: []const u8, suffix: NumberSuffix, tok_i: TokenIndex) !Result {
+fn parseFloat(p: *Parser, buf: []const u8, suffix: number_literal.Suffix, tok_i: TokenIndex) !Result {
     const qt: QualType = switch (suffix) {
         .None, .I => .double,
         .F, .IF => .float,
@@ -11134,13 +10899,13 @@ fn parseFloat(p: *Parser, buf: []const u8, suffix: NumberSuffix, tok_i: TokenInd
             else => unreachable,
         };
     });
-    var res = Result{
+    var res: Result = .{
         .qt = qt,
         .node = try p.addNode(.{ .float_literal = .{ .qt = qt, .literal_tok = tok_i } }),
         .val = val,
     };
     if (suffix.isImaginary()) {
-        try p.err(p.tok_i, .gnu_imaginary_constant, .{});
+        try p.err(tok_i, .gnu_imaginary_constant, .{});
         res.qt = try qt.toComplex(p.comp);
 
         res.val = try Value.intern(p.comp, switch (qt.bitSizeof(p.comp)) {
@@ -11156,54 +10921,7 @@ fn parseFloat(p: *Parser, buf: []const u8, suffix: NumberSuffix, tok_i: TokenInd
     return res;
 }
 
-fn getIntegerPart(p: *Parser, buf: []const u8, prefix: NumberPrefix, tok_i: TokenIndex) ![]const u8 {
-    if (buf[0] == '.') return "";
-
-    if (!prefix.digitAllowed(buf[0])) {
-        switch (prefix) {
-            .binary => try p.err(tok_i, .invalid_binary_digit, .{text_literal.Ascii.init(buf[0])}),
-            .octal => try p.err(tok_i, .invalid_octal_digit, .{text_literal.Ascii.init(buf[0])}),
-            .hex => try p.err(tok_i, .invalid_int_suffix, .{buf}),
-            .decimal => unreachable,
-        }
-        return error.ParsingFailed;
-    }
-
-    for (buf, 0..) |c, idx| {
-        if (idx == 0) continue;
-        switch (c) {
-            '.' => return buf[0..idx],
-            'p', 'P' => return if (prefix == .hex) buf[0..idx] else {
-                try p.err(tok_i, .invalid_int_suffix, .{buf[idx..]});
-                return error.ParsingFailed;
-            },
-            'e', 'E' => {
-                switch (prefix) {
-                    .hex => continue,
-                    .decimal => return buf[0..idx],
-                    .binary => try p.err(tok_i, .invalid_binary_digit, .{text_literal.Ascii.init(c)}),
-                    .octal => try p.err(tok_i, .invalid_octal_digit, .{text_literal.Ascii.init(c)}),
-                }
-                return error.ParsingFailed;
-            },
-            '0'...'9', 'a'...'d', 'A'...'D', 'f', 'F' => {
-                if (!prefix.digitAllowed(c)) {
-                    switch (prefix) {
-                        .binary => try p.err(tok_i, .invalid_binary_digit, .{text_literal.Ascii.init(c)}),
-                        .octal => try p.err(tok_i, .invalid_octal_digit, .{text_literal.Ascii.init(c)}),
-                        .decimal, .hex => try p.err(tok_i, .invalid_int_suffix, .{buf[idx..]}),
-                    }
-                    return error.ParsingFailed;
-                }
-            },
-            '\'' => {},
-            else => return buf[0..idx],
-        }
-    }
-    return buf;
-}
-
-fn fixedSizeInt(p: *Parser, base: u8, buf: []const u8, suffix: NumberSuffix, tok_i: TokenIndex) !Result {
+fn fixedSizeInt(p: *Parser, base: u8, buf: []const u8, suffix: number_literal.Suffix, tok_i: TokenIndex) !Result {
     var val: u64 = 0;
     var overflow = false;
     for (buf) |c| {
@@ -11294,10 +11012,7 @@ fn fixedSizeInt(p: *Parser, base: u8, buf: []const u8, suffix: NumberSuffix, tok
     return res;
 }
 
-fn parseInt(p: *Parser, prefix: NumberPrefix, buf: []const u8, suffix: NumberSuffix, tok_i: TokenIndex) !Result {
-    if (prefix == .binary) {
-        try p.err(tok_i, .binary_integer_literal, .{});
-    }
+fn parseInt(p: *Parser, prefix: number_literal.Prefix, buf: []const u8, suffix: number_literal.Suffix, tok_i: TokenIndex) !Result {
     const base = @backingInt(prefix);
     var res = if (suffix.isBitInt())
         try p.bitInt(base, buf, suffix, tok_i)
@@ -11313,10 +11028,8 @@ fn parseInt(p: *Parser, prefix: NumberPrefix, buf: []const u8, suffix: NumberSuf
     return res;
 }
 
-fn bitInt(p: *Parser, base: u8, buf: []const u8, suffix: NumberSuffix, tok_i: TokenIndex) Error!Result {
+fn bitInt(p: *Parser, base: u8, buf: []const u8, suffix: number_literal.Suffix, tok_i: TokenIndex) Error!Result {
     const gpa = p.comp.gpa;
-    try p.err(tok_i, .pre_c23_compat, .{"'_BitInt' suffix for literals"});
-    try p.err(tok_i, .bitint_suffix, .{});
 
     var managed = try big.int.Managed.init(gpa);
     defer managed.deinit();
@@ -11360,120 +11073,30 @@ fn bitInt(p: *Parser, base: u8, buf: []const u8, suffix: NumberSuffix, tok_i: To
     return res;
 }
 
-fn getFracPart(p: *Parser, buf: []const u8, prefix: NumberPrefix, tok_i: TokenIndex) ![]const u8 {
-    if (buf.len == 0 or buf[0] != '.') return "";
-    assert(prefix != .octal);
-    if (prefix == .binary) {
-        try p.err(tok_i, .invalid_int_suffix, .{buf});
-        return error.ParsingFailed;
-    }
-    for (buf, 0..) |c, idx| {
-        if (idx == 0) continue;
-        if (c == '\'') continue;
-        if (!prefix.digitAllowed(c)) return buf[0..idx];
-    }
-    return buf;
-}
-
-fn getExponent(p: *Parser, buf: []const u8, prefix: NumberPrefix, tok_i: TokenIndex) ![]const u8 {
-    if (buf.len == 0) return "";
-
-    switch (buf[0]) {
-        'e', 'E' => assert(prefix == .decimal),
-        'p', 'P' => if (prefix != .hex) {
-            try p.err(tok_i, .invalid_float_suffix, .{buf});
-            return error.ParsingFailed;
-        },
-        else => return "",
-    }
-    const end = for (buf, 0..) |c, idx| {
-        if (idx == 0) continue;
-        if (idx == 1 and (c == '+' or c == '-')) continue;
-        switch (c) {
-            '0'...'9' => {},
-            '\'' => continue,
-            else => break idx,
-        }
-    } else buf.len;
-    const exponent = buf[0..end];
-    if (std.mem.findAny(u8, exponent, "0123456789") == null) {
-        try p.err(tok_i, .exponent_has_no_digits, .{});
-        return error.ParsingFailed;
-    }
-    return exponent;
-}
-
 /// Using an explicit `tok_i` parameter instead of `p.tok_i` makes it easier
 /// to parse numbers in pragma handlers.
-pub fn parseNumberToken(p: *Parser, tok_i: TokenIndex) !Result {
-    const buf = p.tokSlice(tok_i);
-    const allow_fixed_size_int_suffixes = p.comp.langopts.allowFixedSizedIntSuffixes();
-    const prefix = NumberPrefix.fromString(buf, allow_fixed_size_int_suffixes);
-    const after_prefix = buf[prefix.stringLen()..];
-
-    const int_part = try p.getIntegerPart(after_prefix, prefix, tok_i);
-
-    const after_int = after_prefix[int_part.len..];
-
-    const frac = try p.getFracPart(after_int, prefix, tok_i);
-    const after_frac = after_int[frac.len..];
-
-    const exponent = try p.getExponent(after_frac, prefix, tok_i);
-    const suffix_str = after_frac[exponent.len..];
-    const is_float = (exponent.len > 0 or frac.len > 0);
-    const suffix = NumberSuffix.fromString(suffix_str, if (is_float) .float else .int, allow_fixed_size_int_suffixes) orelse {
-        if (is_float) {
-            try p.err(tok_i, .invalid_float_suffix, .{suffix_str});
-        } else {
-            try p.err(tok_i, .invalid_int_suffix, .{suffix_str});
-        }
-        return error.ParsingFailed;
+pub fn parseNumberToken(p: *Parser, num: TokenIndex) !Result {
+    var number_literal_parser: number_literal.Parser = .{
+        .comp = p.comp,
+        .literal = p.tokSlice(num),
+        .loc = p.pp.tokens.items(.loc)[num],
+        .expansion_locs = p.pp.expansionSlice(num),
     };
-    if (suffix.isFloat80() and p.comp.float80Type() == null) {
-        try p.err(tok_i, .invalid_float_suffix, .{suffix_str});
-        return error.ParsingFailed;
-    }
+    const parsed = try number_literal_parser.parse();
 
-    if (is_float) {
-        assert(prefix == .hex or prefix == .decimal);
-        if (prefix == .hex and exponent.len == 0) {
-            try p.err(tok_i, .hex_floating_constant_requires_exponent, .{});
-            return error.ParsingFailed;
-        }
-        const number = buf[0 .. buf.len - suffix_str.len];
-        return p.parseFloat(number, suffix, tok_i);
+    if (parsed.is_float) {
+        return p.parseFloat(parsed.bytes, parsed.suffix, num);
     } else {
-        return p.parseInt(prefix, int_part, suffix, tok_i);
+        return p.parseInt(parsed.prefix, parsed.bytes, parsed.suffix, num);
     }
 }
 
 fn ppNum(p: *Parser) Error!Result {
-    defer p.tok_i += 1;
-    var res = try p.parseNumberToken(p.tok_i);
-    if (p.in_macro) {
-        const res_sk = res.qt.scalarKind(p.comp);
-        if (res_sk.isFloat() or !res_sk.isReal()) {
-            try p.err(p.tok_i, .float_literal_in_pp_expr, .{});
-            return error.ParsingFailed;
-        }
-        res.qt = if (res.qt.signedness(p.comp) == .unsigned)
-            try p.comp.type_store.intmax.makeIntUnsigned(p.comp)
-        else
-            p.comp.type_store.intmax;
-    } else if (res.val.opt_ref != .none) {
-        try res.putValue(p);
-    }
+    const num = p.tok_i;
+    p.tok_i += 1;
+    var res = try p.parseNumberToken(num);
+    try res.putValue(p);
     return res;
-}
-
-/// Run a parser function but do not evaluate the result
-fn parseNoEval(p: *Parser, comptime func: fn (*Parser) Error!?Result) Error!Result {
-    const no_eval = p.no_eval;
-    defer p.no_eval = no_eval;
-    p.no_eval = true;
-
-    const parsed = try func(p);
-    return p.expectResult(parsed);
 }
 
 /// genericSelection : keyword_generic '(' assignExpr ',' genericAssoc (',' genericAssoc)* ')'
@@ -11487,7 +11110,7 @@ fn genericSelection(p: *Parser) Error!?Result {
     const l_paren = try p.expectToken(.l_paren);
     const controlling_tok = p.tok_i;
 
-    const controlling = try p.parseNoEval(assignExpr);
+    const controlling = try p.expectResult(try p.binaryExpr(.conditional, false));
     var controlling_qt = controlling.qt;
     if (controlling_qt.is(p.comp, .array)) {
         controlling_qt = try controlling_qt.decay(p.comp);
