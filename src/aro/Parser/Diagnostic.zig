@@ -568,7 +568,7 @@ pub const expected_parens_around_typename: Diagnostic = .{
     .kind = .@"error",
 };
 
-pub const alignof_expr: Diagnostic = .{
+pub const gnu_alignof_expr: Diagnostic = .{
     .fmt = "'{s}' applied to an expression is a GNU extension",
     .opt = .@"gnu-alignof-expression",
     .kind = .warning,
@@ -1821,6 +1821,12 @@ pub const unused_label: Diagnostic = .{
     .fmt = "unused label '{s}'",
     .kind = .warning,
     .opt = .@"unused-label",
+};
+
+pub const unused_comparison: Diagnostic = .{
+    .fmt = "{s} comparison result unused",
+    .kind = .warning,
+    .opt = .@"unused-comparison",
 };
 
 pub const invalid_imag: Diagnostic = .{
