@@ -436,6 +436,7 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
         .serenity => try define(w, "__serenity__"),
         .@"switch" => try define(w, "__SWITCH__"),
         .@"3ds" => try define(w, "__3DS__"),
+        .gba => try define(w, "__GBA__"),
         .psp => try define(w, "__PSP__"),
         .psx => try define(w, "__psx__"),
         .vita => try define(w, "__vita__"),
@@ -717,7 +718,7 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
                     try w.writeAll("#define _MIPS_ISA _MIPS_ISA_MIPS64\n");
                 },
             }
-            if (target.mipsCpuName()) |name| {
+            if (target.cpu.model.llvm_name) |name| {
                 try w.print("#define _MIPS_ARCH \"{s}\"\n", .{name});
                 var buf: [16]u8 = undefined;
                 const upper = std.ascii.upperString(&buf, name);
@@ -821,6 +822,11 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
             try define(w, "__arm__");
             try define(w, "__arm");
             try define(w, "__ARM_32BIT_STATE");
+            try define(w, "__APCS_32__");
+            try define(w, "__VFP_FP__");
+            try define(w, "__ARM_FP16_ARGS");
+            try define(w, "__ARM_FP16_FORMAT_IEEE");
+
             try w.writeAll("#define __ARM_ACLE 200\n");
 
             // see https://clang.llvm.org/doxygen/Basic_2Targets_2ARM_8cpp_source.html
@@ -862,7 +868,7 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
                 try define(w, "__ARM_FEATURE_CLZ");
             }
 
-            if (target.cpu.has(.arm, .dsp)) {
+            if (target.armHasDsp()) {
                 try define(w, "__ARM_FEATURE_DSP");
             }
 
@@ -879,7 +885,7 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
                 sat = true;
             }
 
-            if (target.cpu.has(.arm, .dsp) or sat) {
+            if (target.armHasDsp() or sat) {
                 try define(w, "__ARM_FEATURE_QBIT");
             }
 
@@ -1235,6 +1241,13 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
     try comp.generateIntMaxAndWidth(w, "INT", .int);
     try comp.generateIntMaxAndWidth(w, "LONG", .long);
     try comp.generateIntMaxAndWidth(w, "LONG_LONG", .long_long);
+    if (comp.langopts.has_int24) {
+        const suffix = if (Type.Int.int.bits(comp) == 8) "LL" else "L";
+        const unsigned_suffix = if (Type.Int.int.bits(comp) == 8) "ULL" else "UL";
+        try w.print("#define __INT24_MAX__ 8388607{s}\n", .{suffix});
+        try w.writeAll("#define __INT24_MIN__ (-__INT24_MAX__-1)\n");
+        try w.print("#define __UINT24_MAX__ 16777215{s}\n", .{unsigned_suffix});
+    }
     try comp.generateIntMaxAndWidth(w, "WCHAR", comp.type_store.wchar);
     try comp.generateIntMaxAndWidth(w, "WINT", comp.type_store.wint);
     try comp.generateIntMaxAndWidth(w, "INTMAX", comp.type_store.intmax);
@@ -1505,6 +1518,9 @@ pub fn smallestNBitIntTargetIndependent(comp: *const Compilation, bits: usize, s
 
 /// Lowest-rank integer type with at least N bits; subject to platform idiosyncrasies
 pub fn intLeastN(comp: *const Compilation, bits: usize, signedness: std.builtin.Signedness) QualType {
+    if (bits <= 24 and bits > Type.Int.int.bits(comp) and comp.langopts.has_int24) {
+        return if (signedness == .signed) .int24 else .uint24;
+    }
     if (bits == 64 and (comp.target.os.tag.isDarwin() or comp.target.cpu.arch.isWasm())) {
         // WebAssembly and Darwin use `long long` for `int_least64_t` and `int_fast64_t`.
         return if (signedness == .signed) .long_long else .ulong_long;
@@ -1726,10 +1742,12 @@ fn generateSizeofType(comp: *Compilation, w: *Io.Writer, name: []const u8, qt: Q
 
 pub fn nextLargestIntSameSign(comp: *const Compilation, qt: QualType) ?QualType {
     assert(qt.isInt(comp));
-    const candidates: [4]QualType = if (qt.signedness(comp) == .signed)
-        .{ .short, .int, .long, .long_long }
+    const candidates: []const QualType = if (qt.signedness(comp) == .signed)
+        if (comp.langopts.has_int24) &.{ .short, .int, .int24, .long, .long_long } else &.{ .short, .int, .long, .long_long }
+    else if (comp.langopts.has_int24)
+        &.{ .ushort, .uint, .uint24, .ulong, .ulong_long }
     else
-        .{ .ushort, .uint, .ulong, .ulong_long };
+        &.{ .ushort, .uint, .ulong, .ulong_long };
 
     const size = qt.sizeof(comp);
     for (candidates) |candidate| {
@@ -1907,6 +1925,7 @@ pub fn addSourceFromOwnedBuffer(comp: *Compilation, path: []const u8, buf: [:0]u
 
     if (i != contents.len) {
         var list: std.ArrayList(u8) = .{
+            .pointer_stability = .{},
             .items = contents[0..i],
             .capacity = contents.len + 1, // +1 for sentinel
         };
