@@ -275,6 +275,11 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
             , .{ name, name });
         }
     }.defineStd;
+    const defineBool = struct {
+        fn defineBool(_w: *Io.Writer, name: []const u8, value: bool) !void {
+            try _w.print("#define {s} {d}\n", .{ name, @intFromBool(value) });
+        }
+    }.defineBool;
     const target = &comp.target;
     const ptr_width = target.ptrBitWidth();
     const is_gnu = comp.langopts.standard.isGNU();
@@ -335,6 +340,68 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
         .emscripten => try define(w, "__EMSCRIPTEN_PTHREADS__"),
         else => {},
     };
+
+    // Target OS macros, transcribed from LLVM TargetOSMacros.def
+    if (comp.langopts.hasTargetOsMacros()) {
+        // Windows
+        try defineBool(w, "TARGET_OS_WIN32", target.os.tag == .windows);
+        try defineBool(w, "TARGET_OS_WINDOWS", target.os.tag == .windows);
+
+        // Linux
+        try defineBool(w, "TARGET_OS_LINUX", target.os.tag == .linux);
+
+        // Unix
+        try defineBool(
+            w,
+            "TARGET_OS_UNIX",
+            switch (target.os.tag) {
+                .freebsd, .openbsd, .netbsd, .illumos => true,
+                else => false,
+            },
+        );
+
+        // Apple Targets
+        try defineBool(w, "TARGET_OS_MAC", target.os.tag.isDarwin());
+        // NOTE: LLVM checks the triple for "Triple::Darwin" as well, but this
+        // is different from "isOSDarwin()" and would be like if Zig had a
+        // ".darwin" OS tag, but it doesn't.
+        try defineBool(w, "TARGET_OS_OSX", target.os.tag == .macos);
+        try defineBool(
+            w,
+            "TARGET_OS_IPHONE",
+            switch (target.os.tag) {
+                .ios, .tvos, .watchos => true,
+                else => false,
+            },
+        );
+        try defineBool(w, "TARGET_OS_IOS", target.os.tag == .ios);
+        try defineBool(w, "TARGET_OS_TV", target.os.tag == .tvos);
+        try defineBool(w, "TARGET_OS_WATCH", target.os.tag == .watchos);
+        try defineBool(w, "TARGET_OS_VISION", target.os.tag == .visionos);
+        try defineBool(w, "TARGET_OS_DRIVERKIT", target.os.tag == .driverkit);
+        // Note that LLVM has this as an actual target environment (ABI). Zig
+        // doesn't, so just doing a best effort here and assuming that all
+        // catalyst apps will be tagged as such in the OS.
+        try defineBool(w, "TARGET_OS_MACCATALYST", target.os.tag == .maccatalyst);
+        // Note that there are no other guards for this macro in LLVM either -
+        // running under the assumption that the only things that uses the
+        // ".simulator" ABI are the appropriate Apple device simulators.
+        try defineBool(w, "TARGET_OS_SIMULATOR", target.abi == .simulator);
+        try defineBool(
+            w,
+            "TARGET_OS_EMBEDDED",
+            switch (target.os.tag) {
+                .ios, .tvos, .visionos, .watchos => true,
+                else => false,
+            } and target.abi != .simulator,
+        );
+        try defineBool(w, "TARGET_OS_NANO", target.os.tag == .watchos);
+        try defineBool(w, "TARGET_IPHONE_SIMULATOR", target.abi == .simulator);
+        try defineBool(w, "TARGET_OS_UIKITFORMAC", target.os.tag == .maccatalyst);
+
+        // UEFI
+        try defineBool(w, "TARGET_OS_UEFI", target.os.tag == .uefi);
+    }
 
     // os macros
     switch (target.os.tag) {
@@ -420,14 +487,23 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
             else
                 mem.print(&version_buf, "{d:0>2}{d:0>2}{d:0>2}", .{ version.major, @min(version.minor, 99), @min(version.patch, 99) }) catch unreachable;
 
-            try w.print("#define {s} {s}\n", .{ switch (target.os.tag) {
-                .tvos => "__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__",
-                .ios, .maccatalyst => "__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__",
-                .watchos => "__ENVIRONMENT_WATCH_OS_VERSION_MIN_REQUIRED__",
-                .driverkit => "__ENVIRONMENT_DRIVERKIT_VERSION_MIN_REQUIRED__",
-                .macos => "__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__",
-                else => unreachable,
-            }, version_str });
+            platform_os_version_define: {
+                try w.print("#define {s} {s}\n", .{
+                    switch (target.os.tag) {
+                        .tvos => "__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__",
+                        .ios, .maccatalyst => "__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__",
+                        .watchos => "__ENVIRONMENT_WATCH_OS_VERSION_MIN_REQUIRED__",
+                        .driverkit => "__ENVIRONMENT_DRIVERKIT_VERSION_MIN_REQUIRED__",
+                        .macos => "__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__",
+                        .visionos => {
+                            // No platform-specific OS version define for visionOS
+                            break :platform_os_version_define;
+                        },
+                        else => unreachable,
+                    },
+                    version_str,
+                });
+            }
 
             try w.print("#define __ENVIRONMENT_OS_VERSION_MIN_REQUIRED__ {s}\n", .{version_str});
         },
@@ -833,12 +909,19 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
             // https://developer.arm.com/documentation/dui0774/g/chr1383660321827
 
             // __ARM_ARCH_ISA_THUMB is defined to 2 if the core supports the Thumb-2 ISA.
-            if (target.cpu.has(.arm, .thumb2) or target.cpu.has(.arm, .thumb_mode)) {
-                try define(w, "__thumb__");
-                const num = if (target.cpu.has(.arm, .thumb2)) "2" else "1";
-                try w.print("#define __ARM_ARCH_ISA_THUMB {s}\n", .{num});
+            if (target.armVersion()) |v| {
+                const supports_thumb2 = mem.eql(u8, v.string, "6T2") or
+                    (v.version >= 7 and !mem.eql(u8, v.string, "8M_BASE"));
+                if (supports_thumb2) {
+                    try w.writeAll("#define __ARM_ARCH_ISA_THUMB 2\n");
+                } else if (mem.indexOfScalar(u8, v.string, 'T') != null or v.version >= 6) {
+                    try w.writeAll("#define __ARM_ARCH_ISA_THUMB 1\n");
+                }
             }
 
+            if (target.cpu.has(.arm, .thumb2) or target.cpu.has(.arm, .thumb_mode)) {
+                try define(w, "__thumb__");
+            }
             // ARM ISA means we are not M profile
             if (!target.cpu.has(.arm, .mclass)) {
                 try define(w, "__ARM_ARCH_ISA_ARM");
@@ -893,6 +976,42 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
                 (target.cpu.has(.arm, .mclass) and target.cpu.has(.arm, .dsp)))
             {
                 try define(w, "__ARM_FEATURE_SIMD32");
+            }
+
+            // Which co-processor intrinsics in arm_acle.h are available.
+            // See https://arm-software.github.io/acle/main/acle.html#coprocessor-intrinsics
+            const coproc = struct {
+                /// __arm_cdp __arm_ldc, __arm_ldcl, __arm_stc,
+                /// __arm_stcl, __arm_mcr and __arm_mrc
+                const b1: u4 = 1 << 0;
+                /// __arm_cdp2, __arm_ldc2, __arm_stc2, __arm_ldc2l,
+                /// __arm_stc2l, __arm_mcr2 and __arm_mrc2
+                const b2: u4 = 1 << 1;
+                /// __arm_mcrr, __arm_mrrc
+                const b3: u4 = 1 << 2;
+                /// __arm_mcrr2, __arm_mrrc2
+                const b4: u4 = 1 << 3;
+
+                const all: u4 = b1 | b2 | b3 | b4;
+            };
+
+            const coproc_bf: u4 = blk: {
+                const v = target.armVersion() orelse break :blk 0;
+                if (mem.eql(u8, v.string, "6M") or mem.eql(u8, v.string, "6SM") or
+                    mem.eql(u8, v.string, "8M_BASE")) break :blk 0;
+                if (mem.eql(u8, v.string, "8M_MAIN") or mem.eql(u8, v.string, "8_1M_MAIN")) break :blk coproc.all;
+                break :blk switch (v.version) {
+                    4 => coproc.b1,
+                    5 => if (mem.eql(u8, v.string, "5T")) coproc.b1 | coproc.b2 else coproc.b1 | coproc.b2 | coproc.b3,
+                    6, 7 => coproc.all,
+                    8, 9 => coproc.b1 | coproc.b3,
+                    else => 0,
+                };
+            };
+            try w.print("#define __ARM_FEATURE_COPROC 0x{x}\n", .{coproc_bf});
+
+            if (arm_version >= 5 and arm_version <= 8 and target.os.tag != .windows) {
+                try define(w, "__THUMB_INTERWORK__");
             }
 
             if (comp.langopts.arm_ldrex) |ldrex| {
@@ -1333,6 +1452,11 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
                 , .{@backingInt(comp.code_gen_options.pic_level)});
             }
         },
+    }
+
+    // Blocks
+    if (comp.langopts.blocks) {
+        try define(w, "__BLOCKS__");
     }
 }
 
